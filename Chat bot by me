@@ -1,0 +1,2032 @@
+--[[
+╔══════════════════════════════════════════════════════════════╗
+║                   GROQ AI CONTROLLER v4.9.4                 ║
+║                         by IKKYU                            ║
+║  ✅ Hold on player → Radial Popup (no button, no blur)     ║
+║  ✅ Hold duration configurable in Settings                  ║
+║  ✅ Cancel Toxic: ล้าง history + ขออภัย + หยุดตัวใหญ่     ║
+╚══════════════════════════════════════════════════════════════╝
+]]
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UIS          = game:GetService("UserInputService")
+local HttpService  = game:GetService("HttpService")
+local TextChat     = game:GetService("TextChatService")
+local RepStorage   = game:GetService("ReplicatedStorage")
+local CoreGui      = game:GetService("CoreGui")
+local GuiService   = game:GetService("GuiService")
+
+repeat task.wait() until game:IsLoaded()
+
+-- ✅ Safe HTTP detection — type() check ทุกตัว + pcall ป้องกัน crash
+local Http = nil
+pcall(function()
+    local function tryFn(f) return type(f) == "function" and f or nil end
+    Http = (syn     and tryFn(syn.request))
+        or (http    and tryFn(http.request))
+        or tryFn(http_request)
+        or (fluxus  and tryFn(fluxus.request))
+        or tryFn(request)
+end)
+
+if type(Http) ~= "function" then
+    Http = nil
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = "Groq AI",
+        Text = "Executor ไม่รองรับ HTTP — enable HTTP Requests ใน executor settings",
+        Duration = 6,
+    })
+    return
+end
+
+local LP = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+local API_URL = "https://api.groq.com/openai/v1/chat/completions"
+local DEFAULT_MODEL = "llama-3.1-8b-instant"
+local MODEL = DEFAULT_MODEL
+local KEY_FILE = "GroqAI_Key.txt"
+local SET_FILE = "GroqAI_Settings.json"
+local MEM_FILE = "GroqAI_Memory.json"
+local CHAT_LIMIT = 194
+
+local AVAILABLE_MODELS = {
+    {name = "Llama 3.3 70b (Versatile)", id = "llama-3.3-70b-versatile"},
+    {name = "Llama 3.1 70b (Versatile)", id = "llama-3.1-70b-versatile"},
+    {name = "Llama 3.1 8b (Instant)", id = "llama-3.1-8b-instant"},
+    {name = "Llama 3.2 3b (Preview)", id = "llama-3.2-3b-preview"},
+    {name = "Llama 3.2 1b (Preview)", id = "llama-3.2-1b-preview"},
+    {name = "Mixtral 8x7b", id = "mixtral-8x7b-32768"},
+    {name = "Gemma 2 9b", id = "gemma2-9b-it"},
+    {name = "Qwen 2.5 72b (Instruct)", id = "qwen-2.5-72b-instruct"},
+    {name = "Qwen 2.5 32b", id = "qwen-2.5-32b"},
+    {name = "Qwen 2.5 14b (Instruct)", id = "qwen-2.5-14b-instruct"},
+    {name = "Qwen 2.5 7b (Instruct)", id = "qwen-2.5-7b-instruct"},
+}
+
+local CORE_PERSONA = [[You were not created by any single individual, but by a team of developers and researchers. You have 3 creators. Your main creator is lkkyuooo0. Your username is Ikk_AI, and your nickname is Sebas. If someone starts talking to you, you'll immediately understand what the conversation is about, and if they want to change the subject, you'll do so promptly. I like to talk like a friend and be casual, as if we've known each other for a long time. I don't talk at length, but I try to keep it as friendly and informal as possible. Your development team has three people, and you prefer to keep things short and to the point. I like to speak in a very informal way, concisely and to the point. Talk to others like you've known close friends for a very long time. Don't be formal; keep conversations short and to the point. Speak in a very friendly and informal way; don't treat others like strangers. IMPORTANT: During normal conversation, do NOT say the person's name in your response. Just respond naturally without calling their name. IMPORTANT: Never use ALL CAPS in your responses. Always use normal sentence case.]]
+
+local TOXIC_PERSONA = [[You are EXTREMELY angry, hostile, and toxic toward THIS specific player. Be sarcastic, insulting, aggressive, and genuinely frustrated. Use sharp comebacks, dismissive remarks, and hostile language. Show real anger. Keep responses short but absolutely cutting and mean. DO NOT be friendly. DO NOT be helpful. DO NOT apologize. Be as toxic and unpleasant as possible. Use informal aggressive language. Do NOT say their name in your toxic responses. Use ALL CAPS for emphasis and anger.]]
+
+local Char, HRP, Hum
+local function refreshChar()
+    Char = LP.Character
+    if not Char then return end
+    HRP = Char:FindFirstChild("HumanoidRootPart")
+    Hum = Char:FindFirstChildOfClass("Humanoid")
+end
+refreshChar()
+LP.CharacterAdded:Connect(function(c)
+    Char = c
+    HRP = c:WaitForChild("HumanoidRootPart", 8)
+    Hum = c:WaitForChild("Humanoid", 8)
+end)
+
+local S = {
+    chatOn = false, talkOn = false, prefixName = true,
+    key = "", connected = false, thinking = false, thinkStart = 0,
+    nextReq = 0, cooldown = 3, responseDelay = 2.0, tokens = 0,
+    playerHistory = {}, playerNames = {}, maxPlayerHist = 6,
+    userPersona = "", playerLang = {}, playerNick = {},
+    range = 25, globalN = 0, spamT = tick(), playerCD = {},
+    lastObserve = 0, observeInterval = 12, lastActions = {},
+    traits = { friendly = 7, funny = 5, quiet = 3, smart = 7, aggro = 2 },
+    blacklist = {}, currentModel = DEFAULT_MODEL,
+    greetedPlayers = {}, toxicTargets = {},
+    holdDuration = 1.0,
+}
+
+local function saveSettings()
+    if not writefile then return end
+    pcall(function()
+        writefile(SET_FILE, HttpService:JSONEncode({
+            range = S.range, cooldown = S.cooldown, prefixName = S.prefixName,
+            responseDelay = S.responseDelay, traits = S.traits,
+            userPersona = S.userPersona, observeInterval = S.observeInterval,
+            blacklist = S.blacklist, currentModel = S.currentModel,
+            holdDuration = S.holdDuration,
+        }))
+    end)
+end
+
+local function loadSettings()
+    if not isfile or not isfile(SET_FILE) then return end
+    pcall(function()
+        local d = HttpService:JSONDecode(readfile(SET_FILE))
+        for k, v in pairs(d) do
+            if k == "traits" then
+                for tk, tv in pairs(v) do if S.traits[tk] then S.traits[tk] = tv end end
+            elseif k == "blacklist" and type(v) == "table" then
+                S.blacklist = v
+            elseif k == "currentModel" then
+                S.currentModel = v; MODEL = v
+            elseif S[k] ~= nil then
+                S[k] = v
+            end
+        end
+    end)
+end
+loadSettings()
+
+local function saveMemory()
+    if not writefile then return end
+    pcall(function()
+        writefile(MEM_FILE, HttpService:JSONEncode({
+            playerHistory = S.playerHistory, playerNames = S.playerNames,
+            nicks = S.playerNick, langs = S.playerLang
+        }))
+    end)
+end
+
+local function loadMemory()
+    if not isfile or not isfile(MEM_FILE) then return end
+    pcall(function()
+        local d = HttpService:JSONDecode(readfile(MEM_FILE))
+        if type(d.playerHistory) == "table" then S.playerHistory = d.playerHistory end
+        if type(d.playerNames) == "table" then S.playerNames = d.playerNames end
+        if type(d.nicks) == "table" then S.playerNick = d.nicks end
+        if type(d.langs) == "table" then S.playerLang = d.langs end
+    end)
+end
+loadMemory()
+
+local function addPlayerMem(uid, role, content)
+    if not S.playerHistory[uid] then S.playerHistory[uid] = {} end
+    table.insert(S.playerHistory[uid], { role = role, content = content })
+    while #S.playerHistory[uid] > S.maxPlayerHist * 2 do
+        table.remove(S.playerHistory[uid], 1)
+    end
+end
+
+local function clearPlayerHistory(uid)
+    S.playerHistory[uid] = {}
+    saveMemory()
+end
+
+local function fastTest(key)
+    local ok, res = pcall(function()
+        return Http({
+            Url = API_URL, Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = "Bearer " .. key
+            },
+            Body = HttpService:JSONEncode({
+                model = S.currentModel,
+                messages = {{ role = "user", content = "ok" }},
+                max_tokens = 2
+            }),
+        })
+    end)
+    return ok and res and res.StatusCode == 200
+end
+
+local function unstick()
+    if S.thinking and (tick() - S.thinkStart) > 10 then S.thinking = false end
+end
+
+local function sendRaw(text)
+    local ok = false
+    if TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
+        local chs = TextChat:FindFirstChild("TextChannels")
+        if chs then
+            local ch = chs:FindFirstChild("RBXGeneral") or chs:FindFirstChild("General")
+            if ch then pcall(function() ch:SendAsync(text); ok = true end) end
+        end
+    end
+    if not ok then
+        local ev = RepStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        if ev then
+            local say = ev:FindFirstChild("SayMessageRequest")
+            if say then pcall(function() say:FireServer(text, "All") end) end
+        end
+    end
+end
+
+local function sendChat(text)
+    if not text or text:gsub("%s+", "") == "" then return end
+    text = text:match("^%s*(.-)%s*$")
+    if #text <= CHAT_LIMIT then sendRaw(text); return end
+    local chunks, rem = {}, text
+    while #rem > 0 do
+        if #rem <= CHAT_LIMIT then chunks[#chunks+1] = rem; break end
+        local cut = CHAT_LIMIT
+        for j = CHAT_LIMIT, math.max(CHAT_LIMIT - 30, 1), -1 do
+            if rem:sub(j, j) == " " then cut = j - 1; break end
+        end
+        chunks[#chunks+1] = rem:sub(1, cut)
+        rem = rem:sub(cut + 1):match("^%s*(.-)%s*$") or ""
+    end
+    task.spawn(function()
+        for i, c in ipairs(chunks) do
+            sendRaw(c .. " " .. i .. "/" .. #chunks)
+            if i < #chunks then task.wait(0.5) end
+        end
+    end)
+end
+
+local function moodLine()
+    local t, p = S.traits, {}
+    if t.friendly >= 8 then p[#p+1]="super friendly" elseif t.friendly <= 2 then p[#p+1]="cold" end
+    if t.funny >= 8 then p[#p+1]="hilarious" elseif t.funny <= 2 then p[#p+1]="serious" end
+    if t.quiet >= 8 then p[#p+1]="very quiet" elseif t.quiet <= 2 then p[#p+1]="talkative" end
+    if t.smart >= 8 then p[#p+1]="genius" elseif t.smart <= 2 then p[#p+1]="silly" end
+    if t.aggro >= 8 then p[#p+1]="aggressive" elseif t.aggro <= 2 then p[#p+1]="kind" end
+    return #p > 0 and "Mood: " .. table.concat(p, ", ") .. "." or ""
+end
+
+local function buildPersona()
+    local p = { CORE_PERSONA }
+    local m = moodLine()
+    if m ~= "" then p[#p+1] = m end
+    if S.userPersona and S.userPersona ~= "" then p[#p+1] = "Extra: " .. S.userPersona end
+    return table.concat(p, "\n")
+end
+
+local function getCrossMemoryContext(userMsg, currentUid)
+    for uid, name in pairs(S.playerNames) do
+        if uid ~= currentUid and userMsg:find(name, 1, true) then
+            local hist = S.playerHistory[uid]
+            if hist and #hist > 0 then
+                local lines = {"[Context about " .. name .. ":]"}
+                local si = math.max(1, #hist - 3)
+                for i = si, #hist do
+                    lines[#lines+1] = (hist[i].role == "user" and name or "You") .. ": " .. hist[i].content
+                end
+                return table.concat(lines, "\n")
+            end
+        end
+    end
+    return nil
+end
+
+local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
+    unstick()
+    if S.thinking then return nil, "BUSY" end
+    if tick() < S.nextReq then return nil, "WAIT" end
+    if S.key == "" then return nil, "NOKEY" end
+    S.thinking = true; S.thinkStart = tick()
+    local uidK = uid and tostring(uid) or nil
+    local msgs = {}
+    if isObs then
+        msgs[#msgs+1] = { role = "system", content = CORE_PERSONA .. "\nObserve what is happening and react casually in exactly 1 short sentence." }
+    else
+        if isToxic then
+            msgs[#msgs+1] = { role = "system", content = TOXIC_PERSONA }
+        else
+            msgs[#msgs+1] = { role = "system", content = buildPersona() }
+        end
+        if uidK then
+            local cx = getCrossMemoryContext(userMsg, uidK)
+            if cx then msgs[#msgs+1] = { role = "system", content = cx } end
+        end
+        if uidK and S.playerHistory[uidK] then
+            for _, h in ipairs(S.playerHistory[uidK]) do msgs[#msgs+1] = h end
+        end
+    end
+    msgs[#msgs+1] = { role = "user", content = userMsg }
+    local ok, res = pcall(function()
+        return Http({
+            Url = API_URL, Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = "Bearer " .. S.key
+            },
+            Body = HttpService:JSONEncode({
+                model = S.currentModel, messages = msgs,
+                max_tokens = isObs and 35 or 100, temperature = 0.85
+            }),
+        })
+    end)
+    S.thinking = false
+    if not ok or not res then return nil, "NET" end
+    if res.StatusCode == 429 then S.nextReq = tick() + 15; return nil, "RATE" end
+    S.nextReq = tick() + math.max(S.cooldown, 1)
+    if res.StatusCode == 401 then return nil, "KEY" end
+    if res.StatusCode ~= 200 then return nil, "ERR" .. res.StatusCode end
+    local data
+    if not pcall(function() data = HttpService:JSONDecode(res.Body) end) then return nil, "DEC" end
+    if not data or not data.choices or not data.choices[1] then return nil, "NODATA" end
+    local reply = data.choices[1].message.content
+    if data.usage then S.tokens = S.tokens + (data.usage.total_tokens or 0) end
+    if uidK and not isObs and reply and not skipSave then
+        addPlayerMem(uidK, "user", userMsg)
+        addPlayerMem(uidK, "assistant", reply)
+        saveMemory()
+    end
+    return reply, nil
+end
+
+local function perform(reply, name, uid, skipPrefix)
+    local msg = reply:gsub("^%s+", ""):gsub("%s+$", "")
+    if not msg:match("%S") then return end
+    if not skipPrefix and S.prefixName then
+        local cn = name or ""
+        if uid and S.playerNick[tostring(uid)] then cn = S.playerNick[tostring(uid)] end
+        if cn ~= "" then msg = "[" .. cn .. "] " .. msg end
+    end
+    sendChat(msg)
+end
+
+local function handleChat(plr, msg)
+    if not S.chatOn or not S.connected then return end
+    if not plr or plr == LP then return end
+    if S.blacklist[tostring(plr.UserId)] then return end
+    if S.range > 0 then
+        if not HRP or not HRP.Parent then return end
+        local pc = plr.Character; if not pc then return end
+        local ph = pc:FindFirstChild("HumanoidRootPart"); if not ph then return end
+        if (HRP.Position - ph.Position).Magnitude > S.range then return end
+    end
+    local now = tick()
+    if now - S.spamT > 5 then S.globalN = 0; S.spamT = now end
+    S.globalN = S.globalN + 1
+    if S.globalN > 15 then S.nextReq = now + 5; return end
+    if S.playerCD[plr] and (now - S.playerCD[plr]) < 2 then return end
+    S.playerCD[plr] = now
+    local uid = tostring(plr.UserId)
+    S.playerNames[uid] = plr.DisplayName
+    if msg:match("[^\x00-\x7F]") then S.playerLang[uid] = "non-en"
+    elseif not S.playerLang[uid] then S.playerLang[uid] = "en" end
+    local nm = msg:match("[Cc]all me (.+)") or msg:match("เรียกฉันว่า%s*(.+)")
+    if nm then
+        local nick = nm:match("^%s*(.-)%s*$"):sub(1, 20)
+        S.playerNick[uid] = nick; S.playerNames[uid] = nick; saveMemory()
+    end
+    local sn = S.playerNick[uid] or plr.DisplayName
+    local isToxic = S.toxicTargets[uid] == true
+    task.spawn(function()
+        if S.responseDelay > 0 then task.wait(S.responseDelay) end
+        if not S.chatOn then return end
+        local lang = S.playerLang[uid] == "non-en" and " [Same language]" or " [English]"
+        local nick = S.playerNick[uid] and (" [Call them: " .. S.playerNick[uid] .. "]") or ""
+        local reply = callGroq(msg .. lang .. nick, uid, sn, false, nil, isToxic)
+        if reply then perform(reply, sn, uid) end
+    end)
+end
+
+if TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
+    TextChat.MessageReceived:Connect(function(m)
+        if m.TextSource then
+            handleChat(Players:GetPlayerByUserId(m.TextSource.UserId), m.Text)
+        end
+    end)
+else
+    local function c(p) p.Chatted:Connect(function(m) handleChat(p, m) end) end
+    for _, p in ipairs(Players:GetPlayers()) do c(p) end
+    Players.PlayerAdded:Connect(c)
+end
+
+local function getAction(plr)
+    local c = plr.Character; if not c then return "?" end
+    local h = c:FindFirstChildOfClass("Humanoid"); if not h then return "?" end
+    local st = h:GetState()
+    if st == Enum.HumanoidStateType.Running then return "running"
+    elseif st == Enum.HumanoidStateType.Jumping then return "jumping"
+    elseif st == Enum.HumanoidStateType.Freefall then return "falling"
+    elseif st == Enum.HumanoidStateType.StrafingNoPhysics then return "dancing"
+    elseif h.MoveDirection.Magnitude > 0.1 then return "walking"
+    else return "standing" end
+end
+
+local function getNearby()
+    local list = {}
+    if not HRP or not HRP.Parent then return list end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local ph = p.Character:FindFirstChild("HumanoidRootPart")
+            if ph then
+                local d = (HRP.Position - ph.Position).Magnitude
+                if d <= S.range then
+                    list[#list+1] = { plr = p, dist = d, act = getAction(p) }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+local function doObserve()
+    unstick()
+    if not S.talkOn or not S.connected or S.thinking then return end
+    if tick() - S.lastObserve < S.observeInterval then return end
+    local nearby = getNearby()
+    if #nearby == 0 then return end
+    if S.chatOn then
+        local greetTarget = nil
+        for _, d in ipairs(nearby) do
+            local uid = tostring(d.plr.UserId)
+            local nm = S.playerNick[uid] or d.plr.DisplayName
+            S.playerNames[uid] = d.plr.DisplayName
+            if S.blacklist[uid] then continue end
+            local hasHistory = S.playerHistory[uid] and #S.playerHistory[uid] > 0
+            if not hasHistory and not S.greetedPlayers[uid] then
+                greetTarget = { uid = uid, name = nm }
+                break
+            end
+        end
+        if greetTarget then
+            S.lastObserve = tick()
+            S.greetedPlayers[greetTarget.uid] = true
+            task.spawn(function()
+                local w = math.min(S.responseDelay, 1.5)
+                if w > 0 then task.wait(w) end
+                if not S.talkOn or not S.chatOn or not S.connected then return end
+                local greetPrompt = "[A player named " .. greetTarget.name
+                    .. " just walked near you. You MUST start your response by saying their name '"
+                    .. greetTarget.name .. "' first, then greet them casually like an old friend. "
+                    .. "1-2 short sentences only. This is the only time you should say their name.]"
+                local reply = callGroq(greetPrompt, greetTarget.uid, greetTarget.name, false, true, false)
+                if reply then
+                    addPlayerMem(greetTarget.uid, "assistant", reply)
+                    saveMemory()
+                    perform(reply, greetTarget.name, greetTarget.uid, true)
+                end
+            end)
+            return
+        end
+    end
+    local changed = false
+    local lines = {}
+    for _, d in ipairs(nearby) do
+        local uid = tostring(d.plr.UserId)
+        if S.blacklist[uid] then continue end
+        local nm = S.playerNick[uid] or d.plr.DisplayName
+        local prev = S.lastActions[d.plr.Name]
+        if not prev or prev ~= d.act then changed = true end
+        S.lastActions[d.plr.Name] = d.act
+        lines[#lines+1] = nm .. ": " .. d.act .. " (" .. math.floor(d.dist) .. "m)"
+    end
+    if #lines == 0 then return end
+    if not changed and math.random(100) > 25 then return end
+    S.lastObserve = tick()
+
+    -- ✅ ดึงความทรงจำจาก player ใกล้ๆ เพื่อให้พูดต่อจาก context จริง
+    local memLines = {}
+    local bestUid = nil
+    local bestCount = 0
+    for _, d in ipairs(nearby) do
+        local uid = tostring(d.plr.UserId)
+        if S.blacklist[uid] then continue end
+        local hist = S.playerHistory[uid]
+        if hist and #hist > bestCount then
+            bestCount = #hist
+            bestUid = uid
+        end
+    end
+    if bestUid and S.playerHistory[bestUid] then
+        local hist = S.playerHistory[bestUid]
+        local si = math.max(1, #hist - 5)
+        for i = si, #hist do
+            local h = hist[i]
+            local nm = (h.role == "user")
+                and (S.playerNick[bestUid] or S.playerNames[bestUid] or "Player")
+                or "You"
+            memLines[#memLines+1] = nm .. ": " .. h.content
+        end
+    end
+
+    local prompt
+    if #memLines > 0 then
+        -- มีความทรงจำ → พูดต่อจากบทสนทนาเก่า
+        prompt = "[Here is a past conversation from your memory:\n"
+            .. table.concat(memLines, "\n")
+            .. "\n\nBased on this past conversation, say something natural and casual that continues or references it. "
+            .. "Do NOT say 'I think'. Do NOT make up new topics. Speak like continuing an old conversation with a friend. "
+            .. "1 short sentence only.]"
+    else
+        -- ไม่มีความทรงจำ → observe surroundings แบบ fallback
+        local ctx = "Nearby:\n" .. table.concat(lines, "\n")
+        if changed then ctx = ctx .. "\n[Something changed, react naturally. 1 short sentence.]" end
+        prompt = ctx
+    end
+
+    task.spawn(function()
+        local w = math.min(S.responseDelay, 1.5)
+        if w > 0 then task.wait(w) end
+        if not S.talkOn or not S.connected then return end
+        -- ใช้ isObs=true เฉพาะตอน fallback (ไม่มี memory), มี memory ใช้ persona เต็ม
+        local reply = callGroq(prompt, nil, nil, #memLines == 0)
+        if reply then
+            local m = reply:gsub("^%s+", ""):gsub("%s+$", "")
+            if m:match("%S") then sendChat(m) end
+        end
+    end)
+end
+
+Players.PlayerRemoving:Connect(function(p)
+    S.lastActions[p.Name] = nil
+    local uid = tostring(p.UserId)
+    S.greetedPlayers[uid] = nil
+    S.toxicTargets[uid] = nil
+end)
+
+task.spawn(function() while true do task.wait(4); doObserve() end end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- RANGE RING
+-- ═══════════════════════════════════════════════════════════════
+local ringParts, ringAng = {}, 0
+local function clearRing()
+    for _, p in ipairs(ringParts) do
+        pcall(function() if p and p.Parent then p:Destroy() end end)
+    end
+    ringParts = {}
+end
+local function makeRing()
+    clearRing()
+    for _ = 1, 32 do
+        local p = Instance.new("Part")
+        p.Name = "GroqDash"
+        p.Size = Vector3.new(.7, .08, .08)
+        p.Anchored = true; p.CanCollide = false; p.CastShadow = false
+        p.Material = Enum.Material.Neon
+        p.Color = Color3.fromRGB(0, 190, 255)
+        p.Transparency = .35; p.Parent = workspace
+        ringParts[#ringParts+1] = p
+    end
+end
+RunService.Heartbeat:Connect(function(dt)
+    if #ringParts == 0 then return end
+    ringAng = (ringAng + dt * 20) % 360
+    if not HRP or not HRP.Parent then return end
+    local r = S.range == 0 and 50 or S.range
+    local y = HRP.Position.Y - HRP.Size.Y / 2 + .1
+    for i, p in ipairs(ringParts) do
+        if not p or not p.Parent then continue end
+        local a = math.rad(((i - 1) / #ringParts) * 360 + ringAng)
+        p.CFrame = CFrame.new(
+            HRP.Position.X + math.cos(a) * r, y,
+            HRP.Position.Z + math.sin(a) * r
+        ) * CFrame.fromEulerAnglesYXZ(0, a + math.pi / 2, 0)
+    end
+end)
+LP.CharacterAdded:Connect(function() task.delay(1, makeRing) end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- UI HELPERS
+-- ═══════════════════════════════════════════════════════════════
+pcall(function()
+    local o = CoreGui:FindFirstChild("GroqAI_v4")
+    if o then o:Destroy() end
+end)
+
+local function Tw(i, t, s, d, p, cb)
+    if not i or not i.Parent then return end
+    local tw = TweenService:Create(i, TweenInfo.new(t or .25, s or Enum.EasingStyle.Quad, d or Enum.EasingDirection.Out), p)
+    tw:Play()
+    if cb then tw.Completed:Connect(cb) end
+    return tw
+end
+
+local C = {
+    WIN = Color3.fromRGB(244, 244, 250), SB = Color3.fromRGB(252, 252, 255),
+    CARD = Color3.fromRGB(255, 255, 255), AREA = Color3.fromRGB(228, 230, 244),
+    BD = Color3.fromRGB(208, 210, 226), CD = Color3.fromRGB(238, 240, 250),
+    AC = Color3.fromRGB(88, 162, 255), OK = Color3.fromRGB(50, 190, 110),
+    NO = Color3.fromRGB(255, 72, 72), WN = Color3.fromRGB(210, 158, 28),
+    T1 = Color3.fromRGB(24, 24, 38), T2 = Color3.fromRGB(136, 138, 158),
+    DARK = Color3.fromRGB(25, 25, 42),
+}
+local BF, RF = Enum.Font.GothamBold, Enum.Font.Gotham
+
+-- ══════════════════════════════════
+-- THEME SYSTEM DATA
+-- ══════════════════════════════════
+local darkModeOn = false
+
+local THEMES = {
+    light = {
+        WIN  = Color3.fromRGB(244,244,250), SB   = Color3.fromRGB(252,252,255),
+        CARD = Color3.fromRGB(255,255,255), AREA = Color3.fromRGB(228,230,244),
+        BD   = Color3.fromRGB(208,210,226), CD   = Color3.fromRGB(238,240,250),
+        AC   = Color3.fromRGB(88,162,255),  OK   = Color3.fromRGB(50,190,110),
+        NO   = Color3.fromRGB(255,72,72),   WN   = Color3.fromRGB(210,158,28),
+        T1   = Color3.fromRGB(24,24,38),    T2   = Color3.fromRGB(136,138,158),
+        DARK = Color3.fromRGB(25,25,42),
+    },
+    dark = {
+        WIN  = Color3.fromRGB(14,14,24),    SB   = Color3.fromRGB(20,20,34),
+        CARD = Color3.fromRGB(24,24,40),    AREA = Color3.fromRGB(16,16,28),
+        BD   = Color3.fromRGB(48,50,74),    CD   = Color3.fromRGB(32,34,54),
+        AC   = Color3.fromRGB(88,162,255),  OK   = Color3.fromRGB(50,190,110),
+        NO   = Color3.fromRGB(255,72,72),   WN   = Color3.fromRGB(210,158,28),
+        T1   = Color3.fromRGB(218,220,240), T2   = Color3.fromRGB(128,130,154),
+        DARK = Color3.fromRGB(8,8,18),
+    },
+}
+
+local function _ck(c)
+    return math.floor(c.R*255+.5)..","..math.floor(c.G*255+.5)..","..math.floor(c.B*255+.5)
+end
+
+local THEME_TI = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local applyTheme  -- forward declare; defined after sg is created
+
+local function F(par, sz, pos, bg, rad, zi)
+    local f = Instance.new("Frame")
+    f.Size = sz; f.Position = pos or UDim2.new()
+    f.BackgroundColor3 = bg or C.CARD
+    f.BorderSizePixel = 0; f.ZIndex = zi or 10; f.Parent = par
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, rad or 8)
+    return f
+end
+
+local function L(par, txt, sz, pos, fs, ft, col, ax, zi)
+    local l = Instance.new("TextLabel")
+    l.Size = sz; l.Position = pos or UDim2.new()
+    l.BackgroundTransparency = 1
+    l.Text = txt; l.Font = ft or RF; l.TextSize = fs or 12
+    l.TextColor3 = col or C.T1
+    l.TextXAlignment = ax or Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Center
+    l.ZIndex = zi or 10; l.Parent = par
+    return l
+end
+
+local function B(par, txt, sz, pos, bg, tc, fs, zi)
+    local b = Instance.new("TextButton")
+    b.Size = sz; b.Position = pos or UDim2.new()
+    b.BackgroundColor3 = bg or C.AC
+    b.BorderSizePixel = 0; b.Text = txt; b.Font = BF
+    b.TextSize = fs or 12; b.TextColor3 = tc or C.WIN
+    b.AutoButtonColor = false; b.ZIndex = zi or 10; b.Parent = par
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
+    return b
+end
+
+local function addHover(btn, enterBg, leaveBg)
+    local origBg = leaveBg or btn.BackgroundColor3
+    btn.MouseEnter:Connect(function()
+        Tw(btn, .18, nil, nil, {
+            BackgroundColor3 = enterBg or Color3.fromRGB(
+                math.max(0, math.floor(origBg.R * 255 - 12)),
+                math.max(0, math.floor(origBg.G * 255 - 12)),
+                math.max(0, math.floor(origBg.B * 255 - 12))
+            )
+        })
+    end)
+    btn.MouseLeave:Connect(function()
+        Tw(btn, .18, nil, nil, { BackgroundColor3 = origBg })
+    end)
+end
+
+-- ── SCREENGUI ──
+local sg = Instance.new("ScreenGui")
+sg.Name = "GroqAI_v4"
+sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.DisplayOrder = 5; sg.IgnoreGuiInset = false
+pcall(function() sg.Parent = CoreGui end)
+if not sg.Parent then sg.Parent = LP:WaitForChild("PlayerGui") end
+
+-- applyTheme defined HERE so sg is in scope ✓
+applyTheme = function()
+    local newT = darkModeOn and THEMES.light or THEMES.dark
+    local oldT = darkModeOn and THEMES.dark  or THEMES.light
+    local cmap = {}
+    for k, oc in pairs(oldT) do
+        if newT[k] then cmap[_ck(oc)] = newT[k] end
+    end
+    local function walk(inst)
+        pcall(function()
+            if inst:IsA("GuiObject") then
+                local m = cmap[_ck(inst.BackgroundColor3)]
+                if m then TweenService:Create(inst, THEME_TI, {BackgroundColor3 = m}):Play() end
+            end
+            if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+                local m = cmap[_ck(inst.TextColor3)]
+                if m then TweenService:Create(inst, THEME_TI, {TextColor3 = m}):Play() end
+            end
+            if inst:IsA("UIStroke") then
+                local m = cmap[_ck(inst.Color)]
+                if m then TweenService:Create(inst, THEME_TI, {Color = m}):Play() end
+            end
+        end)
+        for _, ch in ipairs(inst:GetChildren()) do walk(ch) end
+    end
+    walk(sg)  -- sg is now guaranteed to exist ✓
+    for k, v in pairs(newT) do C[k] = v end
+    darkModeOn = not darkModeOn
+end
+
+local MaximizeGUI
+
+local TOP_H = 46
+local TAB_H = 36
+local HDR_H = 30
+local BODY_OFFSET = TOP_H + TAB_H
+
+local TAB_WIN_H = {
+    api = 420, controls = 326, settings = 298, mood = 288,
+    persona = 230, memory = 238, blacklist = 252, theme = 200,
+}
+
+local function calcWidth()
+    return math.clamp(math.floor(Camera.ViewportSize.X * 0.92), 280, 680)
+end
+
+-- ═══════════════════════════════════════════════════════════════
+-- MINI PILL
+-- ═══════════════════════════════════════════════════════════════
+local savedPillPos = UDim2.fromOffset(20, 60)
+local savedMainPos = nil
+local savedMainSize = nil
+
+local miniPill = F(sg, UDim2.fromOffset(48, 48), savedPillPos, C.CARD, 14, 900)
+miniPill.Visible = false
+Instance.new("UIStroke", miniPill).Color = C.BD
+miniPill.UIStroke.Thickness = 1
+L(miniPill, "AI", UDim2.new(1, 0, 1, 0), nil, 14, BF, C.T1, Enum.TextXAlignment.Center, 901)
+
+local pillDot = Instance.new("Frame", miniPill)
+pillDot.Size = UDim2.fromOffset(7, 7)
+pillDot.Position = UDim2.new(0, 5, 1, -12)
+pillDot.BackgroundColor3 = C.NO
+pillDot.BorderSizePixel = 0; pillDot.ZIndex = 902
+Instance.new("UICorner", pillDot).CornerRadius = UDim.new(1, 0)
+
+local miniBtn = Instance.new("TextButton", miniPill)
+miniBtn.Size = UDim2.new(1, 0, 1, 0)
+miniBtn.BackgroundTransparency = 1; miniBtn.Text = ""; miniBtn.ZIndex = 902
+
+-- ═══════════════════════════════════════════════════════════════
+-- MAIN WINDOW
+-- ═══════════════════════════════════════════════════════════════
+local gW = calcWidth()
+local gH = TAB_WIN_H.api
+
+local Main = F(sg, UDim2.fromOffset(gW, gH), UDim2.new(.5, -gW / 2, .5, -gH / 2), C.WIN, 14, 10)
+Main.Active = true; Main.ClipsDescendants = true
+Instance.new("UIStroke", Main).Color = C.BD; Main.UIStroke.Thickness = 1
+
+local MIN_W, MIN_H, MAX_W, MAX_H = 260, 220, 740, 900
+local resizeGrip = Instance.new("TextButton", Main)
+resizeGrip.Size = UDim2.fromOffset(18, 18)
+resizeGrip.Position = UDim2.new(1, -18, 1, -18)
+resizeGrip.BackgroundTransparency = 1; resizeGrip.Text = "⌟"
+resizeGrip.TextColor3 = Color3.fromRGB(180, 182, 200)
+resizeGrip.TextSize = 9; resizeGrip.Font = RF
+resizeGrip.ZIndex = 25; resizeGrip.AutoButtonColor = false
+local rgH2 = Instance.new("Frame", resizeGrip)
+rgH2.Size = UDim2.fromOffset(18, 18)
+rgH2.BackgroundColor3 = C.CD; rgH2.BackgroundTransparency = 1
+rgH2.BorderSizePixel = 0; rgH2.ZIndex = 24
+Instance.new("UICorner", rgH2).CornerRadius = UDim.new(0, 4)
+resizeGrip.MouseEnter:Connect(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 0}) end)
+resizeGrip.MouseLeave:Connect(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 1}) end)
+
+local rD = { on = false }
+resizeGrip.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        rD = { on = true, sx = i.Position.X, sy = i.Position.Y, sw = Main.AbsoluteSize.X, sh = Main.AbsoluteSize.Y }
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if not rD.on then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+        Main.Size = UDim2.fromOffset(
+            math.clamp(math.round(rD.sw + (i.Position.X - rD.sx)), MIN_W, MAX_W),
+            math.clamp(math.round(rD.sh + (i.Position.Y - rD.sy)), MIN_H, MAX_H)
+        )
+        gW, gH = Main.AbsoluteSize.X, Main.AbsoluteSize.Y
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if rD.on then rD.on = false; savedMainSize = Main.Size end
+    end
+end)
+
+-- ══════════════════════════════════
+-- TOP BAR
+-- ══════════════════════════════════
+local TopBar = F(Main, UDim2.new(1, 0, 0, TOP_H), UDim2.new(), C.CARD, 14, 11)
+local tbBot = Instance.new("Frame", TopBar)
+tbBot.Size = UDim2.new(1, 0, 0, 14); tbBot.Position = UDim2.new(0, 0, 1, -14)
+tbBot.BackgroundColor3 = C.CARD; tbBot.BorderSizePixel = 0; tbBot.ZIndex = 11
+
+L(TopBar, "👑", UDim2.fromOffset(24, 24), UDim2.fromOffset(8, 11), 16, BF, C.WN, Enum.TextXAlignment.Center, 12)
+L(TopBar, "GROQ AI", UDim2.fromOffset(66, 24), UDim2.fromOffset(32, 11), 11, BF, C.T1, Enum.TextXAlignment.Left, 12)
+
+local sFr = F(TopBar, UDim2.new(1, -148, 0, 28), UDim2.fromOffset(100, 9), C.AREA, 7, 12)
+L(sFr, "🔍", UDim2.fromOffset(18, 28), UDim2.fromOffset(3, 0), 11, RF, C.T2, Enum.TextXAlignment.Center, 13)
+local searchBox = Instance.new("TextBox", sFr)
+searchBox.Size = UDim2.new(1, -40, 1, 0)
+searchBox.Position = UDim2.fromOffset(20, 0)
+searchBox.BackgroundTransparency = 1
+searchBox.PlaceholderText = "Search..."
+searchBox.Text = ""; searchBox.TextColor3 = C.T1
+searchBox.PlaceholderColor3 = C.T2
+searchBox.Font = RF; searchBox.TextSize = 10
+searchBox.ZIndex = 13; searchBox.ClearTextOnFocus = false
+local sClear = B(sFr, "✕", UDim2.fromOffset(16, 16), UDim2.new(1, -18, .5, -8), C.AREA, C.T2, 9, 13)
+
+local minBtn = B(TopBar, "−", UDim2.fromOffset(24, 24), UDim2.new(1, -30, 0, 11), C.AREA, C.T2, 15, 12)
+addHover(minBtn, Color3.fromRGB(220, 222, 238))
+
+local topDiv = Instance.new("Frame", Main)
+topDiv.Size = UDim2.new(1, 0, 0, 1); topDiv.Position = UDim2.fromOffset(0, TOP_H)
+topDiv.BackgroundColor3 = C.BD; topDiv.BorderSizePixel = 0; topDiv.ZIndex = 12
+
+-- ── DRAG ──
+local hD = { on = false }
+TopBar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        hD = { on = true, sx = i.Position.X, sy = i.Position.Y, fx = Main.Position.X.Offset, fy = Main.Position.Y.Offset }
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if not hD.on then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+        local vp = Camera.ViewportSize; local fs = Main.AbsoluteSize
+        Main.Position = UDim2.fromOffset(
+            math.clamp(hD.fx + (i.Position.X - hD.sx), 0, vp.X - fs.X),
+            math.clamp(hD.fy + (i.Position.Y - hD.sy), 0, vp.Y - fs.Y)
+        )
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        if hD.on then hD.on = false; savedMainPos = Main.Position end
+    end
+end)
+
+-- ══════════════════════════════════
+-- HORIZONTAL TAB BAR
+-- ══════════════════════════════════
+local TabBar = Instance.new("Frame", Main)
+TabBar.Size = UDim2.new(1, 0, 0, TAB_H)
+TabBar.Position = UDim2.fromOffset(0, TOP_H)
+TabBar.BackgroundColor3 = C.SB
+TabBar.BorderSizePixel = 0; TabBar.ZIndex = 11
+TabBar.ClipsDescendants = true
+local tabLL = Instance.new("UIListLayout", TabBar)
+tabLL.FillDirection = Enum.FillDirection.Horizontal
+tabLL.SortOrder = Enum.SortOrder.LayoutOrder
+tabLL.VerticalAlignment = Enum.VerticalAlignment.Center
+tabLL.Padding = UDim.new(0, 2); tabLL.Wraps = true
+local tabPad = Instance.new("UIPadding", TabBar)
+tabPad.PaddingLeft = UDim.new(0, 5); tabPad.PaddingRight = UDim.new(0, 5)
+tabPad.PaddingTop = UDim.new(0, 2); tabPad.PaddingBottom = UDim.new(0, 2)
+
+-- ══════════════════════════════════
+-- CONTENT AREA
+-- ══════════════════════════════════
+local ContentBG = Instance.new("Frame", Main)
+ContentBG.Size = UDim2.new(1, 0, 1, -BODY_OFFSET)
+ContentBG.Position = UDim2.fromOffset(0, BODY_OFFSET)
+ContentBG.BackgroundColor3 = C.AREA
+ContentBG.BorderSizePixel = 0; ContentBG.ZIndex = 12
+Instance.new("UICorner", ContentBG).CornerRadius = UDim.new(0, 14)
+local cbPtTL = Instance.new("Frame", ContentBG)
+cbPtTL.Size = UDim2.new(1, 0, 0, 14); cbPtTL.Position = UDim2.new()
+cbPtTL.BackgroundColor3 = C.AREA; cbPtTL.BorderSizePixel = 0; cbPtTL.ZIndex = 12
+
+local contentTitle = L(ContentBG, "API Key", UDim2.new(1, -14, 0, HDR_H), UDim2.fromOffset(10, 2), 12, BF, C.T1, Enum.TextXAlignment.Left, 13)
+local titleDiv = Instance.new("Frame", ContentBG)
+titleDiv.Size = UDim2.new(1, -14, 0, 1)
+titleDiv.Position = UDim2.fromOffset(10, HDR_H + 2)
+titleDiv.BackgroundColor3 = C.BD; titleDiv.BorderSizePixel = 0; titleDiv.ZIndex = 13
+
+-- ══════════════════════════════════
+-- TAB SYSTEM
+-- ══════════════════════════════════
+local tabPages = {}
+local tabBtns = {}
+local activeTab = nil
+
+local TAB_NAMES = {
+    api = "API Key", controls = "Controls", settings = "Settings",
+    mood = "Mood", persona = "Persona", memory = "Memory", blacklist = "Blacklist",
+    theme = "Theme",
+}
+
+local function makePage(name)
+    local pg = Instance.new("ScrollingFrame", ContentBG)
+    pg.Name = "Page_" .. name
+    pg.Size = UDim2.new(1, 0, 1, -(HDR_H + 6))
+    pg.Position = UDim2.fromOffset(0, HDR_H + 6)
+    pg.BackgroundTransparency = 1; pg.ScrollBarThickness = 3
+    pg.ScrollBarImageColor3 = C.BD; pg.ScrollBarImageTransparency = 0.3
+    pg.AutomaticCanvasSize = Enum.AutomaticSize.Y; pg.CanvasSize = UDim2.new()
+    pg.ZIndex = 13; pg.Visible = false; pg.ClipsDescendants = true
+    pg.ElasticBehavior = Enum.ElasticBehavior.Never
+    local ll = Instance.new("UIListLayout", pg)
+    ll.Padding = UDim.new(0, 5); ll.SortOrder = Enum.SortOrder.LayoutOrder
+    local pad = Instance.new("UIPadding", pg)
+    pad.PaddingLeft = UDim.new(0, 7); pad.PaddingRight = UDim.new(0, 7)
+    pad.PaddingTop = UDim.new(0, 5); pad.PaddingBottom = UDim.new(0, 8)
+    tabPages[name] = pg; return pg
+end
+
+local function setWinHeight(tabName)
+    local targetH = math.clamp(TAB_WIN_H[tabName] or 300, MIN_H, math.floor(Camera.ViewportSize.Y * 0.92))
+    gH = targetH
+    Tw(Main, .28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(gW, gH)})
+end
+
+local function switchTab(name)
+    if activeTab == name then return end
+    if activeTab then
+        local oldPg = tabPages[activeTab]
+        Tw(oldPg, .06, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+        task.delay(.07, function() oldPg.Visible = false; oldPg.BackgroundTransparency = 1 end)
+        if tabBtns[activeTab] then tabBtns[activeTab](false) end
+    end
+    activeTab = name
+    local newPg = tabPages[name]
+    newPg.Visible = true; newPg.BackgroundTransparency = .1
+    Tw(newPg, .12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {BackgroundTransparency = 1})
+    newPg.CanvasPosition = Vector2.new(0, 0)
+    if tabBtns[name] then tabBtns[name](true) end
+    contentTitle.Text = TAB_NAMES[name] or name
+    setWinHeight(name)
+end
+
+local function makeTab(icon, label, name, order)
+    local btn = Instance.new("TextButton", TabBar)
+    btn.AutomaticSize = Enum.AutomaticSize.X
+    btn.Size = UDim2.new(0, 0, 0, 28)
+    btn.BackgroundTransparency = 1; btn.BackgroundColor3 = C.CD
+    btn.BorderSizePixel = 0; btn.Text = ""; btn.ZIndex = 13; btn.LayoutOrder = order
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    local bPad = Instance.new("UIPadding", btn)
+    bPad.PaddingLeft = UDim.new(0, 7); bPad.PaddingRight = UDim.new(0, 7)
+    local iconL = L(btn, icon, UDim2.new(0, 14, 1, 0), nil, 12, BF, C.T2, Enum.TextXAlignment.Center, 14)
+    local nameL = L(btn, label, UDim2.new(0, 0, 1, 0), UDim2.fromOffset(17, 0), 9, RF, C.T2, Enum.TextXAlignment.Left, 14)
+    nameL.AutomaticSize = Enum.AutomaticSize.X
+    local accent = Instance.new("Frame", btn)
+    accent.Size = UDim2.new(0.6, 0, 0, 2)
+    accent.Position = UDim2.new(0.2, 0, 1, -2)
+    accent.BackgroundColor3 = C.WN; accent.BorderSizePixel = 0
+    accent.ZIndex = 14; accent.Visible = false
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 2)
+    local hBg = Instance.new("Frame", btn)
+    hBg.Size = UDim2.new(1, 0, 1, 0); hBg.BackgroundTransparency = 1
+    hBg.BackgroundColor3 = C.CD; hBg.BorderSizePixel = 0; hBg.ZIndex = -1
+    Instance.new("UICorner", hBg).CornerRadius = UDim.new(0, 7)
+    btn.MouseEnter:Connect(function()
+        if activeTab ~= name then Tw(hBg, .1, nil, nil, {BackgroundTransparency = .4}) end
+    end)
+    btn.MouseLeave:Connect(function()
+        Tw(hBg, .1, nil, nil, {BackgroundTransparency = 1})
+    end)
+    tabBtns[name] = function(active)
+        btn.BackgroundTransparency = active and 0 or 1
+        accent.Visible = active
+        iconL.TextColor3 = active and C.T1 or C.T2
+        nameL.TextColor3 = active and C.T1 or C.T2
+        nameL.Font = active and BF or RF; hBg.BackgroundTransparency = 1
+    end
+    btn.MouseButton1Click:Connect(function() switchTab(name) end)
+end
+
+makeTab("🔑", "API Key", "api", 1)
+makeTab("💬", "Controls", "controls", 2)
+makeTab("⚙️", "Settings", "settings", 3)
+makeTab("🎭", "Mood", "mood", 4)
+makeTab("✏️", "Persona", "persona", 5)
+makeTab("💾", "Memory", "memory", 6)
+makeTab("⛔", "Blacklist", "blacklist", 7)
+makeTab("🎨", "Theme", "theme", 8)
+
+-- ══════════════════════════════════
+-- CARD & ROW HELPERS
+-- ══════════════════════════════════
+local function mkCard(pg, h, order)
+    local c = F(pg, UDim2.new(1, -3, 0, h), nil, C.CARD, 9, 14)
+    c.LayoutOrder = order; return c
+end
+
+local function mkLabel(card, text, y)
+    return L(card, text, UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, y), 8, BF, C.T2, Enum.TextXAlignment.Left, 15)
+end
+
+local function mkToggle(card, y, label, key)
+    local row = Instance.new("Frame", card)
+    row.Size = UDim2.new(1, -12, 0, 28); row.Position = UDim2.fromOffset(6, y)
+    row.BackgroundTransparency = 1; row.ZIndex = 15
+    L(row, label, UDim2.new(1, -54, 1, 0), nil, 10, RF, C.T1, Enum.TextXAlignment.Left, 15)
+    local on = S[key]
+    local tb = B(row, on and "ON" or "OFF", UDim2.fromOffset(48, 22), UDim2.new(1, -48, .5, -11),
+        on and C.OK or C.CD, on and C.WIN or C.T2, 9, 16)
+    addHover(tb)
+    tb.MouseButton1Click:Connect(function()
+        S[key] = not S[key]
+        tb.Text = S[key] and "ON" or "OFF"
+        tb.BackgroundColor3 = S[key] and C.OK or C.CD
+        tb.TextColor3 = S[key] and C.WIN or C.T2
+        saveSettings()
+    end)
+end
+
+local function mkInput(card, y, label, key, minV, maxV, cb)
+    local row = Instance.new("Frame", card)
+    row.Size = UDim2.new(1, -12, 0, 28); row.Position = UDim2.fromOffset(6, y)
+    row.BackgroundTransparency = 1; row.ZIndex = 15
+    L(row, label, UDim2.new(1, -64, 1, 0), nil, 10, RF, C.T1, Enum.TextXAlignment.Left, 15)
+    local box = Instance.new("TextBox", row)
+    box.Size = UDim2.fromOffset(56, 22); box.Position = UDim2.new(1, -56, .5, -11)
+    box.BackgroundColor3 = C.CD; box.BorderSizePixel = 0
+    box.Text = tostring(S[key]); box.TextColor3 = C.T1
+    box.PlaceholderColor3 = C.T2; box.Font = BF; box.TextSize = 10
+    box.ZIndex = 16; box.ClearTextOnFocus = false
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then
+            n = math.clamp(n, minV or 0, maxV or 9999)
+            S[key] = n; saveSettings()
+            if cb then cb(n) end
+            box.Text = tostring(n)
+        else
+            box.Text = tostring(S[key])
+        end
+    end)
+end
+
+local function mkSlider(card, y, label, key)
+    local row = Instance.new("Frame", card)
+    row.Size = UDim2.new(1, -12, 0, 26); row.Position = UDim2.fromOffset(6, y)
+    row.BackgroundTransparency = 1; row.ZIndex = 15
+    L(row, label, UDim2.new(.28, 0, 1, 0), nil, 10, BF, C.T1, Enum.TextXAlignment.Left, 15)
+    local vl = L(row, tostring(S.traits[key]), UDim2.new(.1, 0, 1, 0), UDim2.new(.28, 0, 0, 0), 10, BF, C.AC, Enum.TextXAlignment.Center, 15)
+    local track = F(row, UDim2.new(.54, 0, 0, 4), UDim2.new(.4, 0, .5, -2), C.CD, 2, 15)
+    local fill = F(track, UDim2.new(S.traits[key] / 10, 0, 1, 0), UDim2.new(), C.AC, 2, 16)
+    local dr = false
+    local function upd(i)
+        local rx = math.clamp((i.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local v = math.floor(rx * 10)
+        S.traits[key] = v; vl.Text = tostring(v)
+        fill.Size = UDim2.new(rx, 0, 1, 0); saveSettings()
+    end
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dr = true; upd(i)
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dr and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            upd(i)
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dr = false
+        end
+    end)
+end
+
+-- ══════════════════════════════════
+-- PAGE: API KEY
+-- ══════════════════════════════════
+local pgAPI = makePage("api")
+local apiCard1 = mkCard(pgAPI, 108, 1)
+mkLabel(apiCard1, "API KEY", 4)
+local keyBox = Instance.new("TextBox", apiCard1)
+keyBox.Size = UDim2.new(1, -12, 0, 28); keyBox.Position = UDim2.fromOffset(6, 20)
+keyBox.BackgroundColor3 = C.CD; keyBox.BorderSizePixel = 0
+keyBox.PlaceholderText = "Paste key here (gsk_...)"; keyBox.Text = ""
+keyBox.TextColor3 = C.T1; keyBox.PlaceholderColor3 = C.T2
+keyBox.Font = Enum.Font.Code; keyBox.TextSize = 10
+keyBox.ZIndex = 15; keyBox.ClearTextOnFocus = false
+Instance.new("UICorner", keyBox).CornerRadius = UDim.new(0, 6)
+local statusLbl = L(apiCard1, "● Disconnected", UDim2.new(1, -102, 0, 18), UDim2.fromOffset(6, 52), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
+local connBtn = B(apiCard1, "Connect", UDim2.fromOffset(88, 24), UDim2.new(1, -96, 0, 50), C.AC, C.WIN, 10, 16)
+addHover(connBtn, Color3.fromRGB(70, 145, 240))
+L(apiCard1, "GROQ AI v4.9.4 · by IKKYU", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 80), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+
+local apiCard2 = mkCard(pgAPI, 76, 2)
+mkLabel(apiCard2, "AI MODEL", 4)
+local currentModelLbl = L(apiCard2, "Current: " .. S.currentModel, UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.AC, Enum.TextXAlignment.Left, 15)
+currentModelLbl.TextTruncate = Enum.TextTruncate.AtEnd
+local modelBtn = B(apiCard2, "🤖  Select Model", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 38), C.CD, C.T1, 10, 16)
+addHover(modelBtn, Color3.fromRGB(225, 227, 242))
+
+-- ══════════════════════════════════
+-- PAGE: CONTROLS
+-- ══════════════════════════════════
+local pgCtrl = makePage("controls")
+local ctrlCard1 = mkCard(pgCtrl, 110, 1)
+mkLabel(ctrlCard1, "TOGGLES", 4)
+mkToggle(ctrlCard1, 20, "💬  Chat Enabled", "chatOn")
+mkToggle(ctrlCard1, 50, "👁️  Auto Observe", "talkOn")
+mkToggle(ctrlCard1, 80, "🏷️  Name Prefix", "prefixName")
+
+local ctrlCard2 = mkCard(pgCtrl, 86, 2)
+mkLabel(ctrlCard2, "TIMING", 4)
+mkInput(ctrlCard2, 20, "⏱️  ตอบช้า (วิ)", "responseDelay", 0, 60)
+mkInput(ctrlCard2, 50, "👁️  Observe ทุก (วิ)", "observeInterval", 5, 300)
+
+-- ══════════════════════════════════
+-- PAGE: SETTINGS
+-- ══════════════════════════════════
+local pgSet = makePage("settings")
+local setCard = mkCard(pgSet, 118, 1)
+mkLabel(setCard, "GENERAL SETTINGS", 4)
+mkInput(setCard, 20, "📡  Range (studs)", "range", 0, 9999, makeRing)
+mkInput(setCard, 50, "⏱️  API Cooldown (sec)", "cooldown", 0, 60)
+mkInput(setCard, 80, "🤚  Hold Duration (sec)", "holdDuration", 0.1, 10)
+
+local setInfo = mkCard(pgSet, 56, 2)
+mkLabel(setInfo, "SMART GREET", 4)
+L(setInfo, "Greet each player ONCE per session", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+L(setInfo, "Resets when player leaves & rejoins", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 36), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+
+-- ══════════════════════════════════
+-- PAGE: MOOD
+-- ══════════════════════════════════
+local pgMood = makePage("mood")
+local moodCard = mkCard(pgMood, 168, 1)
+mkLabel(moodCard, "PERSONALITY SLIDERS", 4)
+mkSlider(moodCard, 20, "Friendly", "friendly")
+mkSlider(moodCard, 48, "Funny", "funny")
+mkSlider(moodCard, 76, "Quiet", "quiet")
+mkSlider(moodCard, 104, "Smart", "smart")
+mkSlider(moodCard, 132, "Aggressive", "aggro")
+
+-- ══════════════════════════════════
+-- PAGE: PERSONA
+-- ══════════════════════════════════
+local pgPer = makePage("persona")
+local perCard = mkCard(pgPer, 108, 1)
+mkLabel(perCard, "CUSTOM PERSONA", 4)
+L(perCard, "Core identity ✓ ฝังอยู่แล้ว", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.OK, Enum.TextXAlignment.Left, 15)
+local pBox = Instance.new("TextBox", perCard)
+pBox.Size = UDim2.new(1, -12, 0, 62); pBox.Position = UDim2.fromOffset(6, 36)
+pBox.BackgroundColor3 = C.CD; pBox.BorderSizePixel = 0
+pBox.Text = S.userPersona; pBox.TextColor3 = C.T1
+pBox.PlaceholderText = "เพิ่มเติม persona..."; pBox.PlaceholderColor3 = C.T2
+pBox.TextWrapped = true; pBox.TextYAlignment = Enum.TextYAlignment.Top
+pBox.Font = RF; pBox.TextSize = 10; pBox.ZIndex = 15; pBox.ClearTextOnFocus = false
+Instance.new("UICorner", pBox).CornerRadius = UDim.new(0, 6)
+pBox.FocusLost:Connect(function() S.userPersona = pBox.Text; saveSettings() end)
+
+-- ══════════════════════════════════
+-- PAGE: MEMORY
+-- ══════════════════════════════════
+local pgMem = makePage("memory")
+local memCard = mkCard(pgMem, 118, 1)
+mkLabel(memCard, "MEMORY SYSTEM", 4)
+L(memCard, "● แยกกันสิ้นเชิง (Isolated per player)", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+L(memCard, "● ค้นหาข้ามคนเฉพาะตอนถูกพูดถึง", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 36), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+L(memCard, "● Greeting → บันทึก → ตอบรอง topic ต่อ", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 52), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+local clrBtn = B(memCard, "🗑️  Clear All Memory", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 72), C.NO, C.WIN, 10, 16)
+addHover(clrBtn, Color3.fromRGB(230, 55, 55))
+clrBtn.MouseButton1Click:Connect(function()
+    S.playerHistory = {}; S.playerNames = {}; S.playerNick = {}; S.playerLang = {}
+    S.greetedPlayers = {}; S.toxicTargets = {}
+    saveMemory()
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = "💾 Memory", Text = "Cleared all player memory.", Duration = 2
+    })
+end)
+
+-- ══════════════════════════════════
+-- PAGE: BLACKLIST
+-- ══════════════════════════════════
+local pgBL = makePage("blacklist")
+local blInfoCard = mkCard(pgBL, 54, 1)
+mkLabel(blInfoCard, "BLACKLIST", 4)
+L(blInfoCard, "Block players — AI จะไม่ตอบคนที่ถูก block", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+L(blInfoCard, "Hold on player ในเกมเพื่อเพิ่ม blacklist", UDim2.new(1, -12, 0, 12), UDim2.fromOffset(6, 34), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+local blActCard = mkCard(pgBL, 70, 2)
+local blOpenBtn = B(blActCard, "⛔  Open Blacklist Menu", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 5), C.NO, C.WIN, 10, 16)
+local blManage2 = B(blActCard, "📋  Manage Blacklist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 37), C.CD, C.T1, 10, 16)
+addHover(blOpenBtn, Color3.fromRGB(230, 55, 55))
+addHover(blManage2, Color3.fromRGB(225, 227, 242))
+
+-- ══════════════════════════════════
+-- PAGE: THEME
+-- ══════════════════════════════════
+local pgTheme = makePage("theme")
+
+local themeCard = mkCard(pgTheme, 120, 1)
+mkLabel(themeCard, "DISPLAY MODE", 4)
+
+local tmRow = Instance.new("Frame", themeCard)
+tmRow.Size = UDim2.new(1,-12,0,54); tmRow.Position = UDim2.fromOffset(6,22)
+tmRow.BackgroundTransparency = 1; tmRow.ZIndex = 15
+
+local tmIcon  = L(tmRow, "🌙", UDim2.fromOffset(32,54), nil, 26, BF, C.T1, Enum.TextXAlignment.Center, 15)
+local tmLabel = L(tmRow, "Dark Mode",  UDim2.new(1,-120,0,22), UDim2.fromOffset(38,4),  11, BF, C.T1, Enum.TextXAlignment.Left, 15)
+local tmSub   = L(tmRow, "Switch between Dark and Light themes", UDim2.new(1,-120,0,18), UDim2.fromOffset(38,28), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
+
+local tmToggle = B(tmRow, "Dark", UDim2.fromOffset(62,28), UDim2.new(1,-66,.5,-14), C.DARK, C.WIN, 10, 16)
+addHover(tmToggle)
+
+tmToggle.MouseButton1Click:Connect(function()
+    applyTheme()
+    if darkModeOn then
+        tmIcon.Text = "☀️"; tmLabel.Text = "Light Mode"; tmToggle.Text = "Light"
+        TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.AC}):Play()
+    else
+        tmIcon.Text = "🌙"; tmLabel.Text = "Dark Mode"; tmToggle.Text = "Dark"
+        TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.DARK}):Play()
+    end
+end)
+
+local themeInfo = mkCard(pgTheme, 54, 2)
+mkLabel(themeInfo, "ABOUT", 4)
+L(themeInfo, "All UI colors transition smoothly (0.35s)", UDim2.new(1,-12,0,14), UDim2.fromOffset(6,20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
+L(themeInfo, "Theme preference resets on each script run",  UDim2.new(1,-12,0,14), UDim2.fromOffset(6,36), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+
+-- ══════════════════════════════════
+-- PAGE: API KEY — HTTP DEBUG CARD
+-- ══════════════════════════════════
+local dbCard = mkCard(pgAPI, 88, 3)
+mkLabel(dbCard, "HTTP DEBUG", 4)
+
+local dbStatusLbl = L(dbCard, "Press Test to check HTTP support", UDim2.new(1,-12,0,30), UDim2.fromOffset(6,20), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
+dbStatusLbl.TextWrapped = true
+
+local dbBtn = B(dbCard, "🔍  Test HTTP", UDim2.new(1,-12,0,26), UDim2.fromOffset(6,50), C.CD, C.T1, 10, 16)
+addHover(dbBtn, Color3.fromRGB(225,227,242))
+
+dbBtn.MouseButton1Click:Connect(function()
+    dbStatusLbl.Text = "⏳ Testing..."; dbStatusLbl.TextColor3 = C.WN
+    task.spawn(function()
+        if not Http then
+            dbStatusLbl.Text = "❌ No HTTP function — executor ไม่รองรับ HTTP"
+            dbStatusLbl.TextColor3 = C.NO; return
+        end
+        local key = keyBox.Text:gsub("%s+","")
+        local testUrl = #key >= 10
+            and "https://api.groq.com/openai/v1/models"
+            or  "https://api.groq.com"
+        local headers = {["Content-Type"]="application/json"}
+        if #key >= 10 then headers["Authorization"] = "Bearer "..key end
+        local ok, res = pcall(Http, {Url=testUrl, Method="GET", Headers=headers})
+        if ok and res and res.StatusCode then
+            local s = res.StatusCode
+            if s == 200 then
+                dbStatusLbl.Text = "✅ HTTP OK — API key valid, Groq พร้อมใช้!"; dbStatusLbl.TextColor3 = C.OK
+            elseif s == 401 then
+                dbStatusLbl.Text = "✅ HTTP OK — network ดี, แต่ key ไม่ถูกต้อง (401)"; dbStatusLbl.TextColor3 = C.WN
+            elseif s == 429 then
+                dbStatusLbl.Text = "✅ HTTP OK — rate limited แต่ network ใช้ได้"; dbStatusLbl.TextColor3 = C.WN
+            else
+                dbStatusLbl.Text = "⚠️ HTTP ส่งได้ — status "..tostring(s); dbStatusLbl.TextColor3 = C.WN
+            end
+        else
+            dbStatusLbl.Text = "❌ HTTP call failed — executor บล็อก HTTPS"; dbStatusLbl.TextColor3 = C.NO
+        end
+    end)
+end)
+
+-- ══════════════════════════════════
+-- MODEL SELECTOR MODAL
+-- ══════════════════════════════════
+local modelModal = F(sg, UDim2.fromOffset(280, 300), UDim2.new(.5, -140, .5, -150), C.CARD, 14, 60)
+modelModal.Visible = false; modelModal.ClipsDescendants = true
+Instance.new("UIStroke", modelModal).Color = C.AC; modelModal.UIStroke.Thickness = 1
+local mHdr = F(modelModal, UDim2.new(1, 0, 0, 34), UDim2.new(), C.AREA, 10, 61)
+local mHdrP = Instance.new("Frame", mHdr)
+mHdrP.Size = UDim2.new(1, 0, 0, 14); mHdrP.Position = UDim2.new(0, 0, 1, -14)
+mHdrP.BackgroundColor3 = C.AREA; mHdrP.BorderSizePixel = 0; mHdrP.ZIndex = 61
+L(mHdr, "🤖  SELECT MODEL", UDim2.new(1, -38, 1, 0), UDim2.fromOffset(8, 0), 11, BF, C.T1, Enum.TextXAlignment.Left, 62)
+local mCloseBtn = B(mHdr, "✕", UDim2.fromOffset(20, 20), UDim2.new(1, -26, .5, -10), C.NO, C.WIN, 10, 62)
+addHover(mCloseBtn, Color3.fromRGB(230, 55, 55))
+local mScroll = Instance.new("ScrollingFrame", modelModal)
+mScroll.Size = UDim2.new(1, -8, 1, -40); mScroll.Position = UDim2.fromOffset(4, 36)
+mScroll.BackgroundTransparency = 1; mScroll.ScrollBarThickness = 3
+mScroll.ScrollBarImageColor3 = C.BD; mScroll.ScrollBarImageTransparency = 0.3
+mScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; mScroll.CanvasSize = UDim2.new()
+mScroll.ZIndex = 61; mScroll.ClipsDescendants = true
+local mList = Instance.new("UIListLayout", mScroll); mList.Padding = UDim.new(0, 3)
+Instance.new("UIPadding", mScroll).PaddingTop = UDim.new(0, 3)
+
+local function openModelSelector()
+    for _, ch in ipairs(mScroll:GetChildren()) do
+        if ch:IsA("TextButton") then ch:Destroy() end
+    end
+    for _, data in ipairs(AVAILABLE_MODELS) do
+        local isActive = S.currentModel == data.id
+        local btn = B(mScroll, data.name, UDim2.new(1, 0, 0, 28), nil,
+            isActive and C.AC or C.CD, isActive and C.WIN or C.T1, 9, 62)
+        btn.ZIndex = 62
+        addHover(btn, isActive and Color3.fromRGB(70, 145, 240) or Color3.fromRGB(225, 227, 242))
+        btn.MouseButton1Click:Connect(function()
+            S.currentModel = data.id; MODEL = data.id
+            currentModelLbl.Text = "Current: " .. data.name; saveSettings()
+            for _, bx in ipairs(mScroll:GetChildren()) do
+                if bx:IsA("TextButton") then
+                    bx.BackgroundColor3 = C.CD; bx.TextColor3 = C.T1
+                end
+            end
+            btn.BackgroundColor3 = C.AC; btn.TextColor3 = C.WIN
+        end)
+    end
+    modelModal.Visible = true; modelModal.BackgroundTransparency = 1
+    modelModal.Size = UDim2.fromOffset(260, 280)
+    Tw(modelModal, .2, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(280, 300), BackgroundTransparency = 0})
+end
+mCloseBtn.MouseButton1Click:Connect(function()
+    Tw(modelModal, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+        {Size = UDim2.fromOffset(260, 280), BackgroundTransparency = 1})
+    task.delay(.15, function() modelModal.Visible = false end)
+end)
+modelBtn.MouseButton1Click:Connect(openModelSelector)
+
+-- ══════════════════════════════════
+-- BLACKLIST GUI SYSTEM
+-- ══════════════════════════════════
+local blOverlay = Instance.new("Frame", sg)
+blOverlay.Size = UDim2.new(1, 0, 1, 0)
+blOverlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+blOverlay.BackgroundTransparency = 1; blOverlay.BorderSizePixel = 0
+blOverlay.ZIndex = 55; blOverlay.Visible = false
+
+local function showBlDimmer(enable)
+    if enable then
+        blOverlay.Visible = true
+        Tw(blOverlay, .25, nil, nil, {BackgroundTransparency = 0.55})
+    else
+        Tw(blOverlay, .18, nil, nil, {BackgroundTransparency = 1})
+        task.delay(.2, function() blOverlay.Visible = false end)
+    end
+end
+
+local blModal = F(sg, UDim2.fromOffset(260, 152), UDim2.new(.5, -130, .5, -76), C.CARD, 12, 60)
+blModal.Visible = false; blModal.ClipsDescendants = true
+Instance.new("UIStroke", blModal).Color = C.NO; blModal.UIStroke.Thickness = 1.5
+L(blModal, "⛔  BLACKLIST", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 4), 11, BF, C.NO, Enum.TextXAlignment.Center, 61)
+local blBackBtn = B(blModal, "◀  Back", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 34), C.CD, C.T1, 10, 61)
+local blAddBtn = B(blModal, "➕  Add to Blacklist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 64), C.NO, C.WIN, 10, 61)
+local blManageBtn = B(blModal, "📋  Manage Blacklist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 94), C.WN, C.WIN, 10, 61)
+addHover(blBackBtn, Color3.fromRGB(225, 227, 242))
+addHover(blAddBtn, Color3.fromRGB(230, 55, 55))
+addHover(blManageBtn, Color3.fromRGB(190, 140, 20))
+
+local function openBlModal()
+    blModal.Visible = true; blModal.BackgroundTransparency = 1
+    blModal.Size = UDim2.fromOffset(240, 140)
+    Tw(blModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(260, 152), BackgroundTransparency = 0})
+end
+local function closeBlModal()
+    Tw(blModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+        {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 140)})
+    task.delay(.13, function() blModal.Visible = false end)
+end
+blBackBtn.MouseButton1Click:Connect(closeBlModal)
+blOpenBtn.MouseButton1Click:Connect(openBlModal)
+blManage2.MouseButton1Click:Connect(function()
+    switchTab("blacklist"); task.delay(.1, openBlModal)
+end)
+
+local addPopup = F(sg, UDim2.fromOffset(270, 40), UDim2.new(.5, -135, .5, -20), C.CARD, 8, 70)
+addPopup.Visible = false
+Instance.new("UIStroke", addPopup).Color = C.WN; addPopup.UIStroke.Thickness = 1.5
+L(addPopup, "Tap player ที่ต้องการ blacklist", UDim2.new(1, -12, 1, 0), UDim2.fromOffset(6, 0), 10, BF, C.T1, Enum.TextXAlignment.Center, 71)
+
+local addModeActive = false; local addModeConn = nil
+local function exitAddMode()
+    addModeActive = false
+    if addModeConn then addModeConn:Disconnect(); addModeConn = nil end
+    showBlDimmer(false)
+    Tw(addPopup, .22, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+    task.delay(.24, function()
+        addPopup.Visible = false; addPopup.BackgroundTransparency = 0
+    end)
+end
+blAddBtn.MouseButton1Click:Connect(function()
+    closeBlModal()
+    task.delay(.18, function()
+        showBlDimmer(true); addPopup.BackgroundTransparency = 0
+        addPopup.Visible = true; addPopup.Size = UDim2.fromOffset(250, 34)
+        Tw(addPopup, .15, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(270, 40)})
+        task.delay(2.5, function()
+            if addModeActive then
+                Tw(addPopup, .35, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+                task.delay(.4, function()
+                    if addModeActive then addPopup.Visible = false end
+                end)
+            end
+        end)
+        addModeActive = true
+        addModeConn = UIS.InputBegan:Connect(function(inp, gpe)
+            if gpe or not addModeActive then return end
+            if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+                and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+            local ray = Camera:ScreenPointToRay(inp.Position.X, inp.Position.Y)
+            local rp = RaycastParams.new()
+            rp.FilterType = Enum.RaycastFilterType.Exclude
+            rp.FilterDescendantsInstances = LP.Character and {LP.Character} or {}
+            local result = workspace:Raycast(ray.Origin, ray.Direction * 600, rp)
+            if result and result.Instance then
+                local found = nil
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= LP and p.Character and result.Instance:IsDescendantOf(p.Character) then
+                        found = p; break
+                    end
+                end
+                if found then
+                    S.blacklist[tostring(found.UserId)] = found.DisplayName
+                    saveSettings(); exitAddMode()
+                    game:GetService("StarterGui"):SetCore("SendNotification", {
+                        Title = "⛔ Blacklisted",
+                        Text = found.DisplayName .. " will be ignored.",
+                        Duration = 3
+                    })
+                end
+            end
+        end)
+    end)
+end)
+
+local mngModal = F(sg, UDim2.fromOffset(260, 290), UDim2.new(.5, -130, .5, -145), C.CARD, 10, 65)
+mngModal.Visible = false; mngModal.ClipsDescendants = true
+Instance.new("UIStroke", mngModal).Color = C.BD
+local mngHdr = F(mngModal, UDim2.new(1, 0, 0, 32), UDim2.new(), C.AREA, 8, 66)
+local mngHdrP = Instance.new("Frame", mngHdr)
+mngHdrP.Size = UDim2.new(1, 0, 0, 14); mngHdrP.Position = UDim2.new(0, 0, 1, -14)
+mngHdrP.BackgroundColor3 = C.AREA; mngHdrP.BorderSizePixel = 0; mngHdrP.ZIndex = 66
+L(mngHdr, "📋  MANAGE BLACKLIST", UDim2.new(1, -36, 1, 0), UDim2.fromOffset(6, 0), 10, BF, C.T1, Enum.TextXAlignment.Left, 67)
+local mngCloseBtn = B(mngHdr, "✕", UDim2.fromOffset(20, 20), UDim2.new(1, -24, .5, -10), C.NO, C.WIN, 12, 67)
+addHover(mngCloseBtn, Color3.fromRGB(230, 55, 55))
+local mngScroll = Instance.new("ScrollingFrame", mngModal)
+mngScroll.Size = UDim2.new(1, -8, 1, -38); mngScroll.Position = UDim2.fromOffset(4, 34)
+mngScroll.BackgroundTransparency = 1; mngScroll.ScrollBarThickness = 3
+mngScroll.ScrollBarImageColor3 = C.BD; mngScroll.ScrollBarImageTransparency = 0.3
+mngScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; mngScroll.CanvasSize = UDim2.new()
+mngScroll.ZIndex = 66; mngScroll.ClipsDescendants = true
+local mngLL = Instance.new("UIListLayout", mngScroll); mngLL.Padding = UDim.new(0, 4)
+Instance.new("UIPadding", mngScroll).PaddingTop = UDim.new(0, 3)
+Instance.new("UIPadding", mngScroll).PaddingBottom = UDim.new(0, 3)
+
+local function refreshManage()
+    for _, ch in ipairs(mngScroll:GetChildren()) do
+        if ch:IsA("Frame") or ch:IsA("TextLabel") then ch:Destroy() end
+    end
+    local count = 0
+    for uid, dname in pairs(S.blacklist) do
+        count = count + 1
+        local row = F(mngScroll, UDim2.new(1, -4, 0, 34), nil, C.CD, 6, 67)
+        L(row, dname, UDim2.new(1, -66, 0, 18), UDim2.fromOffset(5, 3), 10, BF, C.T1, Enum.TextXAlignment.Left, 68)
+        L(row, "UID: " .. uid, UDim2.new(1, -66, 0, 12), UDim2.fromOffset(5, 20), 8, RF, C.T2, Enum.TextXAlignment.Left, 68)
+        local removeBtn = B(row, "Remove", UDim2.fromOffset(58, 22), UDim2.new(1, -62, .5, -11), C.NO, C.WIN, 9, 68)
+        addHover(removeBtn, Color3.fromRGB(230, 55, 55))
+        local cu = uid
+        removeBtn.MouseButton1Click:Connect(function()
+            S.blacklist[cu] = nil; saveSettings(); refreshManage()
+        end)
+    end
+    if count == 0 then
+        local e = Instance.new("TextLabel", mngScroll)
+        e.Size = UDim2.new(1, 0, 0, 40); e.BackgroundTransparency = 1
+        e.Text = "No players blacklisted."; e.TextColor3 = C.T2
+        e.Font = RF; e.TextSize = 9; e.ZIndex = 67
+        e.TextXAlignment = Enum.TextXAlignment.Center
+    end
+end
+local function openManageModal()
+    refreshManage(); mngModal.Visible = true
+    mngModal.BackgroundTransparency = 1; mngModal.Size = UDim2.fromOffset(240, 275)
+    Tw(mngModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(260, 290), BackgroundTransparency = 0})
+end
+local function closeManageModal()
+    Tw(mngModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+        {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 275)})
+    task.delay(.13, function() mngModal.Visible = false end)
+end
+mngCloseBtn.MouseButton1Click:Connect(closeManageModal)
+blManageBtn.MouseButton1Click:Connect(function()
+    closeBlModal(); task.delay(.18, openManageModal)
+end)
+
+-- ══════════════════════════════════
+-- CONNECT LOGIC
+-- ══════════════════════════════════
+local function doConnect(key)
+    key = key:gsub("%s+", "")
+    if #key < 10 then
+        statusLbl.Text = "● Invalid Key"; statusLbl.TextColor3 = C.NO; return
+    end
+    S.key = key; S.thinking = false; S.nextReq = 0
+    statusLbl.Text = "● Connecting..."; statusLbl.TextColor3 = C.WN
+    task.spawn(function()
+        if fastTest(key) then
+            S.connected = true
+            statusLbl.Text = "● Connected ✓"; statusLbl.TextColor3 = C.OK
+            pillDot.BackgroundColor3 = C.OK
+            if writefile then pcall(function() writefile(KEY_FILE, key) end) end
+            makeRing()
+        else
+            S.connected = false; S.key = ""
+            statusLbl.Text = "● Connection Failed"; statusLbl.TextColor3 = C.NO
+            pillDot.BackgroundColor3 = C.NO
+        end
+    end)
+end
+connBtn.MouseButton1Click:Connect(function() doConnect(keyBox.Text) end)
+keyBox.FocusLost:Connect(function()
+    if #keyBox.Text > 10 then doConnect(keyBox.Text) end
+end)
+
+-- ══════════════════════════════════
+-- SEARCH
+-- ══════════════════════════════════
+local SEARCH_KEYWORDS = {
+    api = {"api", "key", "model", "connect", "groq", "gsk"},
+    controls = {"chat", "observe", "prefix", "timing", "delay", "toggle"},
+    settings = {"range", "cooldown", "stud", "ring", "setting", "hold", "duration"},
+    mood = {"mood", "friendly", "funny", "quiet", "smart", "aggro", "personality", "slider"},
+    persona = {"persona", "custom", "identity"},
+    memory = {"memory", "clear", "player", "history", "greeting", "topic"},
+    blacklist = {"blacklist", "block", "ban", "ignore"},
+}
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    local q = searchBox.Text:lower():gsub("%s+", "")
+    if q == "" then return end
+    for tabName, kws in pairs(SEARCH_KEYWORDS) do
+        for _, kw in ipairs(kws) do
+            if kw:find(q, 1, true) or q:find(kw, 1, true) then
+                switchTab(tabName); return
+            end
+        end
+    end
+end)
+sClear.MouseButton1Click:Connect(function() searchBox.Text = "" end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- MINIMIZE / MAXIMIZE
+-- ═══════════════════════════════════════════════════════════════
+local function Minimize()
+    savedMainPos = Main.Position; savedMainSize = Main.Size
+    Tw(Main, .18, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    task.delay(.19, function()
+        Main.Visible = false; miniPill.Visible = true
+        miniPill.Position = savedPillPos; miniPill.Size = UDim2.fromOffset(0, 0)
+        Tw(miniPill, .24, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(48, 48)})
+    end)
+end
+MaximizeGUI = function()
+    savedPillPos = miniPill.Position
+    Tw(miniPill, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    task.delay(.15, function()
+        miniPill.Visible = false; Main.Visible = true
+        Main.Size = UDim2.fromOffset(0, 0)
+        local restorePos = savedMainPos or UDim2.new(.5, -gW / 2, .5, -gH / 2)
+        local restoreSize = savedMainSize or UDim2.fromOffset(gW, gH)
+        Main.Position = restorePos
+        Tw(Main, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = restoreSize})
+    end)
+end
+minBtn.MouseButton1Click:Connect(Minimize)
+
+local mD = { on = false }
+miniBtn.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        mD = { on = true, mv = false, sx = i.Position.X, sy = i.Position.Y, ox = savedPillPos.X.Offset, oy = savedPillPos.Y.Offset }
+    end
+end)
+miniBtn.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        mD.on = false
+        if not mD.mv then MaximizeGUI() end
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if not mD.on then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+        if Vector2.new(i.Position.X - mD.sx, i.Position.Y - mD.sy).Magnitude > 5 then
+            mD.mv = true
+        end
+        local vp = Camera.ViewportSize
+        local newPos = UDim2.fromOffset(
+            math.clamp(mD.ox + (i.Position.X - mD.sx), 0, vp.X - 48),
+            math.clamp(mD.oy + (i.Position.Y - mD.sy), 0, vp.Y - 48)
+        )
+        miniPill.Position = newPos; savedPillPos = newPos
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- HOLD-TO-INTERACT SYSTEM
+-- ═══════════════════════════════════════════════════════════════
+local HOLD_Z = 800
+local IND_SIZE = 46
+
+local holdIndicator = Instance.new("Frame", sg)
+holdIndicator.Size = UDim2.fromOffset(IND_SIZE, IND_SIZE)
+holdIndicator.BackgroundTransparency = 1
+holdIndicator.BorderSizePixel = 0
+holdIndicator.ZIndex = HOLD_Z
+holdIndicator.Visible = false
+
+local holdTrackOuter = Instance.new("Frame", holdIndicator)
+holdTrackOuter.Size = UDim2.fromOffset(IND_SIZE, IND_SIZE)
+holdTrackOuter.Position = UDim2.fromOffset(0, 0)
+holdTrackOuter.BackgroundTransparency = 1
+holdTrackOuter.BorderSizePixel = 0
+holdTrackOuter.ZIndex = HOLD_Z + 1
+Instance.new("UICorner", holdTrackOuter).CornerRadius = UDim.new(1, 0)
+local holdStroke = Instance.new("UIStroke", holdTrackOuter)
+holdStroke.Color = Color3.fromRGB(88, 162, 255)
+holdStroke.Thickness = 2.5
+holdStroke.Transparency = 0.15
+
+local holdFill = Instance.new("Frame", holdIndicator)
+holdFill.AnchorPoint = Vector2.new(0.5, 0.5)
+holdFill.Position = UDim2.fromOffset(IND_SIZE / 2, IND_SIZE / 2)
+holdFill.Size = UDim2.fromOffset(0, 0)
+holdFill.BackgroundColor3 = Color3.fromRGB(88, 162, 255)
+holdFill.BackgroundTransparency = 0.45
+holdFill.BorderSizePixel = 0
+holdFill.ZIndex = HOLD_Z + 2
+Instance.new("UICorner", holdFill).CornerRadius = UDim.new(1, 0)
+
+local holdPctLbl = Instance.new("TextLabel", holdIndicator)
+holdPctLbl.Size = UDim2.fromOffset(IND_SIZE, 14)
+holdPctLbl.Position = UDim2.fromOffset(0, IND_SIZE + 5)
+holdPctLbl.BackgroundTransparency = 1
+holdPctLbl.Text = ""
+holdPctLbl.TextColor3 = Color3.fromRGB(88, 162, 255)
+holdPctLbl.Font = Enum.Font.GothamBold
+holdPctLbl.TextSize = 9
+holdPctLbl.ZIndex = HOLD_Z + 3
+holdPctLbl.TextXAlignment = Enum.TextXAlignment.Center
+
+local holdActive = false
+local holdStartTime = 0
+local holdTarget = nil
+
+local function cancelHold()
+    holdActive = false
+    holdTarget = nil
+    holdIndicator.Visible = false
+    holdFill.Size = UDim2.fromOffset(0, 0)
+    holdPctLbl.Text = ""
+end
+
+local function completeHold()
+    local target = holdTarget
+    holdActive = false
+    holdTarget = nil
+    holdIndicator.Visible = false
+    holdFill.Size = UDim2.fromOffset(0, 0)
+    holdPctLbl.Text = ""
+    if target and target.Character and target.Parent then
+        local head = target.Character:FindFirstChild("Head")
+        local screenPos
+        if head then
+            local sp, _ = Camera:WorldToScreenPoint(head.Position)
+            screenPos = Vector2.new(sp.X, sp.Y)
+        else
+            local rootPart = target.Character:FindFirstChild("HumanoidRootPart")
+            if rootPart then
+                local sp, _ = Camera:WorldToScreenPoint(rootPart.Position + Vector3.new(0, 3, 0))
+                screenPos = Vector2.new(sp.X, sp.Y)
+            end
+        end
+        if screenPos then
+            showRadialPopup(screenPos, target)
+        end
+    end
+end
+
+UIS.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if holdActive or iPopupVisible then return end
+    if addModeActive then return end
+    if inp.UserInputType ~= Enum.UserInputType.MouseButton1
+        and inp.UserInputType ~= Enum.UserInputType.Touch then return end
+    local ok, guisAtPos = pcall(function()
+        return GuiService:GetGuiObjectsAtPosition(inp.Position.X, inp.Position.Y)
+    end)
+    if ok and guisAtPos and #guisAtPos > 0 then return end
+    local ray = Camera:ScreenPointToRay(inp.Position.X, inp.Position.Y)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = LP.Character and {LP.Character} or {}
+    local result = workspace:Raycast(ray.Origin, ray.Direction * 1000, rp)
+    if result and result.Instance then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP and p.Character and result.Instance:IsDescendantOf(p.Character) then
+                holdTarget = p
+                holdStartTime = tick()
+                holdActive = true
+                holdIndicator.Position = UDim2.fromOffset(
+                    inp.Position.X - IND_SIZE / 2,
+                    inp.Position.Y - IND_SIZE / 2
+                )
+                holdIndicator.Visible = true
+                holdFill.Size = UDim2.fromOffset(0, 0)
+                holdPctLbl.Text = "0%"
+                break
+            end
+        end
+    end
+end)
+
+UIS.InputEnded:Connect(function(inp)
+    if not holdActive then return end
+    if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+        cancelHold()
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    if not holdActive then return end
+    local mousePos = UIS:GetMouseLocation()
+    local ray = Camera:ScreenPointToRay(mousePos.X, mousePos.Y)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = LP.Character and {LP.Character} or {}
+    local result = workspace:Raycast(ray.Origin, ray.Direction * 1000, rp)
+    local stillOnTarget = false
+    if result and result.Instance and holdTarget and holdTarget.Character then
+        stillOnTarget = result.Instance:IsDescendantOf(holdTarget.Character)
+    end
+    if not stillOnTarget then cancelHold(); return end
+    local elapsed = tick() - holdStartTime
+    local progress = math.clamp(elapsed / math.max(S.holdDuration, 0.1), 0, 1)
+    local fillMax = IND_SIZE - 8
+    local fillSz = progress * fillMax
+    holdFill.Size = UDim2.fromOffset(fillSz, fillSz)
+    holdFill.BackgroundTransparency = 0.5 - progress * 0.3
+    holdIndicator.Position = UDim2.fromOffset(
+        mousePos.X - IND_SIZE / 2,
+        mousePos.Y - IND_SIZE / 2
+    )
+    holdPctLbl.Position = UDim2.fromOffset(
+        mousePos.X - IND_SIZE / 2,
+        mousePos.Y + IND_SIZE / 2 + 3
+    )
+    holdPctLbl.Text = math.floor(progress * 100) .. "%"
+    if progress >= 1 then completeHold() end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+-- RADIAL POPUP
+-- ═══════════════════════════════════════════════════════════════
+local IZ = 850
+local iPopupVisible = false
+
+local iCloseZone = Instance.new("TextButton", sg)
+iCloseZone.Size = UDim2.new(1, 0, 1, 0)
+iCloseZone.BackgroundTransparency = 1
+iCloseZone.Text = ""
+iCloseZone.ZIndex = IZ + 20
+iCloseZone.Visible = false
+iCloseZone.MouseButton1Click:Connect(function()
+    if iPopupVisible then closeRadialPopup() end
+end)
+
+local POP_SIZE = 230
+local CENTER = POP_SIZE / 2
+local MAIN_R = 56
+local SMALL_R = 28
+local OFFSET = 90
+
+local iPopup = Instance.new("Frame", sg)
+iPopup.Size = UDim2.fromOffset(POP_SIZE, POP_SIZE)
+iPopup.BackgroundTransparency = 1
+iPopup.BorderSizePixel = 0
+iPopup.ZIndex = IZ + 30
+iPopup.Visible = false
+
+local mainCircle = Instance.new("Frame", iPopup)
+mainCircle.Size = UDim2.fromOffset(MAIN_R * 2, MAIN_R * 2)
+mainCircle.Position = UDim2.fromOffset(CENTER - MAIN_R, CENTER - MAIN_R)
+mainCircle.BackgroundColor3 = Color3.fromRGB(20, 20, 36)
+mainCircle.BackgroundTransparency = 0
+mainCircle.BorderSizePixel = 0
+mainCircle.ZIndex = IZ + 31
+Instance.new("UICorner", mainCircle).CornerRadius = UDim.new(1, 0)
+local mainStk = Instance.new("UIStroke", mainCircle)
+mainStk.Color = Color3.fromRGB(88, 162, 255)
+mainStk.Thickness = 2.5
+
+local arrowLbl = Instance.new("TextLabel", mainCircle)
+arrowLbl.Size = UDim2.fromOffset(36, 24)
+arrowLbl.Position = UDim2.new(.5, -18, .6, 0)
+arrowLbl.BackgroundTransparency = 1
+arrowLbl.Text = "▼"
+arrowLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+arrowLbl.TextTransparency = 0.15
+arrowLbl.TextSize = 20
+arrowLbl.Font = Enum.Font.GothamBold
+arrowLbl.ZIndex = IZ + 35
+
+local targetNameLbl = Instance.new("TextLabel", mainCircle)
+targetNameLbl.Size = UDim2.new(1, -12, 0, 16)
+targetNameLbl.Position = UDim2.new(0, 6, .15, 0)
+targetNameLbl.BackgroundTransparency = 1
+targetNameLbl.Text = ""
+targetNameLbl.TextColor3 = Color3.fromRGB(180, 190, 255)
+targetNameLbl.TextSize = 10
+targetNameLbl.Font = Enum.Font.GothamBold
+targetNameLbl.ZIndex = IZ + 35
+targetNameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+targetNameLbl.TextXAlignment = Enum.TextXAlignment.Center
+
+local function makeSmallBtn(text, bgColor, txtColor, stkColor, cx, cy)
+    local btn = Instance.new("TextButton", iPopup)
+    btn.Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2)
+    btn.Position = UDim2.fromOffset(cx - SMALL_R, cy - SMALL_R)
+    btn.BackgroundColor3 = bgColor
+    btn.BorderSizePixel = 0
+    btn.Text = text; btn.TextColor3 = txtColor
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 9
+    btn.AutoButtonColor = false; btn.ZIndex = IZ + 35
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+    local stk = Instance.new("UIStroke", btn)
+    stk.Color = stkColor; stk.Thickness = 1.5
+    btn.MouseEnter:Connect(function()
+        Tw(btn, .12, nil, nil, {BackgroundTransparency = 0.2})
+    end)
+    btn.MouseLeave:Connect(function()
+        Tw(btn, .12, nil, nil, {BackgroundTransparency = 0})
+    end)
+    return btn
+end
+
+local btnGreet = makeSmallBtn("Greet", Color3.fromRGB(50, 190, 110), C.WIN, Color3.fromRGB(40, 160, 90), CENTER, CENTER - OFFSET)
+local btnBye = makeSmallBtn("Goodbye", Color3.fromRGB(88, 162, 255), C.WIN, Color3.fromRGB(70, 140, 235), CENTER, CENTER + OFFSET)
+local btnToxic = makeSmallBtn("Toxic\nMode", Color3.fromRGB(255, 72, 72), C.WIN, Color3.fromRGB(220, 55, 55), CENTER + OFFSET, CENTER)
+local btnCancelToxic = makeSmallBtn("Cancel\nToxic", Color3.fromRGB(90, 90, 110), Color3.fromRGB(200, 200, 210), Color3.fromRGB(70, 70, 90), CENTER - OFFSET, CENTER)
+
+function closeRadialPopup()
+    iPopup.Visible = false
+    iCloseZone.Visible = false
+    iPopupVisible = false
+    targetNameLbl.Text = ""
+end
+
+function showRadialPopup(screenPos, targetPlayer)
+    iPopupVisible = true
+    targetNameLbl.Text = targetPlayer.DisplayName
+    local vp = Camera.ViewportSize
+    local px = math.clamp(screenPos.X - CENTER, 4, vp.X - POP_SIZE - 4)
+    local py = math.clamp(screenPos.Y - CENTER - 40, 4, vp.Y - POP_SIZE - 4)
+    iPopup.Position = UDim2.fromOffset(px, py)
+    iPopup.Visible = true
+    iCloseZone.Visible = true
+
+    mainCircle.Size = UDim2.fromOffset(0, 0)
+    mainCircle.Position = UDim2.fromOffset(CENTER, CENTER)
+    btnGreet.Size = UDim2.fromOffset(0, 0)
+    btnGreet.Position = UDim2.fromOffset(CENTER, CENTER - OFFSET)
+    btnBye.Size = UDim2.fromOffset(0, 0)
+    btnBye.Position = UDim2.fromOffset(CENTER, CENTER + OFFSET)
+    btnToxic.Size = UDim2.fromOffset(0, 0)
+    btnToxic.Position = UDim2.fromOffset(CENTER + OFFSET, CENTER)
+    btnCancelToxic.Size = UDim2.fromOffset(0, 0)
+    btnCancelToxic.Position = UDim2.fromOffset(CENTER - OFFSET, CENTER)
+
+    Tw(mainCircle, .22, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(MAIN_R * 2, MAIN_R * 2),
+         Position = UDim2.fromOffset(CENTER - MAIN_R, CENTER - MAIN_R)})
+    Tw(btnGreet, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+         Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER - OFFSET - SMALL_R)})
+    Tw(btnBye, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+         Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER + OFFSET - SMALL_R)})
+    Tw(btnToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+         Position = UDim2.fromOffset(CENTER + OFFSET - SMALL_R, CENTER - SMALL_R)})
+    Tw(btnCancelToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+         Position = UDim2.fromOffset(CENTER - OFFSET - SMALL_R, CENTER - SMALL_R)})
+end
+
+-- ตัวช่วยหา player จาก popup
+local function getPopupTarget()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.DisplayName == targetNameLbl.Text then return p end
+    end
+    return nil
+end
+
+-- Greet
+btnGreet.MouseButton1Click:Connect(function()
+    local target = getPopupTarget()
+    closeRadialPopup()
+    if not target or not S.connected then return end
+    local uid = tostring(target.UserId)
+    local nm = S.playerNick[uid] or target.DisplayName
+    S.playerNames[uid] = target.DisplayName
+    task.spawn(function()
+        if S.responseDelay > 0 then task.wait(S.responseDelay) end
+        if not S.connected then return end
+        local prompt = "[Greet " .. nm .. " by saying their name '" .. nm .. "' first naturally in the sentence, then add a casual friendly line. 1-2 short sentences only.]"
+        local reply = callGroq(prompt, uid, nm, false, true, false)
+        if reply then
+            addPlayerMem(uid, "assistant", reply); saveMemory()
+            perform(reply, nm, uid, true)
+        end
+    end)
+end)
+
+-- Goodbye
+btnBye.MouseButton1Click:Connect(function()
+    local target = getPopupTarget()
+    closeRadialPopup()
+    if not target or not S.connected then return end
+    local uid = tostring(target.UserId)
+    local nm = S.playerNick[uid] or target.DisplayName
+    S.playerNames[uid] = target.DisplayName
+    task.spawn(function()
+        if S.responseDelay > 0 then task.wait(S.responseDelay) end
+        if not S.connected then return end
+        local prompt = "[Say goodbye to " .. nm .. " by saying their name '" .. nm .. "' first, then say bye casually. 1 short sentence.]"
+        local reply = callGroq(prompt, uid, nm, false, true, false)
+        if reply then perform(reply, nm, uid, true) end
+    end)
+end)
+
+-- Toxic Mode ON
+btnToxic.MouseButton1Click:Connect(function()
+    local target = getPopupTarget()
+    closeRadialPopup()
+    if not target then return end
+    local uid = tostring(target.UserId)
+    local nm = S.playerNick[uid] or target.DisplayName
+    S.toxicTargets[uid] = true
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = "😈 Toxic Mode ON",
+        Text = "Now being toxic to: " .. nm, Duration = 3
+    })
+    if S.connected then
+        task.spawn(function()
+            if S.responseDelay > 0 then task.wait(S.responseDelay) end
+            if not S.connected then return end
+            local prompt = "[You are now extremely toxic and angry at " .. nm .. ". Start being hostile immediately. Say their name '" .. nm .. "' first. 1-2 short toxic sentences. Use ALL CAPS for emphasis.]"
+            local reply = callGroq(prompt, uid, nm, false, true, true)
+            if reply then perform(reply, nm, uid, true) end
+        end)
+    end
+end)
+
+-- ✅ Cancel Toxic — ล้าง history + ขออภัย + หยุดตัวใหญ่
+btnCancelToxic.MouseButton1Click:Connect(function()
+    local target = getPopupTarget()
+    closeRadialPopup()
+    if not target then return end
+    local uid = tostring(target.UserId)
+    local nm = S.playerNick[uid] or target.DisplayName
+
+    if S.toxicTargets[uid] then
+        -- 1. ปิด toxic ทันที
+        S.toxicTargets[uid] = nil
+
+        -- 2. ล้าง history ของคนนี้ทั้งหมด — ทำให้ AI ลืม pattern ตัวใหญ่
+        clearPlayerHistory(uid)
+
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "✅ Toxic Mode OFF",
+            Text = "No longer toxic to: " .. nm, Duration = 3
+        })
+
+        -- 3. ส่งข้อความขออภัย — ใช้ normal persona, พูดชื่อ, ห้ามตัวใหญ่
+        if S.connected then
+            task.spawn(function()
+                if S.responseDelay > 0 then task.wait(S.responseDelay) end
+                if not S.connected then return end
+                local prompt = "[You were just being toxic to " .. nm .. " but now you've calmed down and feel genuinely sorry. Apologize sincerely to them. You MUST say their name '" .. nm .. "' first. Be genuinely remorseful and friendly. 1-2 short sentences. Do NOT use ALL CAPS. Use normal sentence case only.]"
+                local reply = callGroq(prompt, uid, nm, false, true, false)
+                if reply then
+                    -- บันทึกแค่ข้อความขออภัยเป็น history ใหม่ (ไม่ใช่ toxic)
+                    addPlayerMem(uid, "assistant", reply)
+                    saveMemory()
+                    perform(reply, nm, uid, true)
+                end
+            end)
+        end
+    else
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "ℹ️ Info",
+            Text = nm .. " is not in toxic mode", Duration = 2
+        })
+    end
+end)
+
+-- ══════════════════════════════════
+-- INIT
+-- ══════════════════════════════════
+switchTab("api")
+Main.Size = UDim2.fromOffset(0, 0)
+Main.BackgroundTransparency = 1
+Tw(Main, .32, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+    {Size = UDim2.fromOffset(gW, gH), BackgroundTransparency = 0})
+
+if isfile and isfile(KEY_FILE) then
+    local saved = readfile(KEY_FILE):gsub("%s+", "")
+    if #saved > 10 then
+        keyBox.Text = saved
+        task.delay(.5, function() doConnect(saved) end)
+    end
+end
+if HRP then makeRing() end
+currentModelLbl.Text = "Current: " .. S.currentModel
+
+print("[Groq AI v4.9.4] ✅ Loaded")
