@@ -8,41 +8,106 @@
 ╚══════════════════════════════════════════════════════════════╝
 ]]
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local UIS          = game:GetService("UserInputService")
-local HttpService  = game:GetService("HttpService")
-local TextChat     = game:GetService("TextChatService")
-local RepStorage   = game:GetService("ReplicatedStorage")
-local CoreGui      = game:GetService("CoreGui")
-local GuiService   = game:GetService("GuiService")
+-- ═══════════════════════════════════════════════════════════════
+-- SAFE SERVICE GETTERS - ป้องกัน error ถ้า service ไม่พร้อม
+-- ═══════════════════════════════════════════════════════════════
+local Players, RunService, TweenService, UIS, HttpService, TextChat, RepStorage, CoreGui, GuiService, StarterGui
 
-repeat task.wait() until game:IsLoaded()
+local function safeGetService(serviceName)
+    local ok, result = pcall(function()
+        return game:GetService(serviceName)
+    end)
+    if ok and result then
+        return result
+    end
+    return nil
+end
 
--- ✅ Safe HTTP detection — type() check ทุกตัว + pcall ป้องกัน crash
+Players = safeGetService("Players")
+RunService = safeGetService("RunService")
+TweenService = safeGetService("TweenService")
+UIS = safeGetService("UserInputService")
+HttpService = safeGetService("HttpService")
+TextChat = safeGetService("TextChatService")
+RepStorage = safeGetService("ReplicatedStorage")
+CoreGui = safeGetService("CoreGui")
+GuiService = safeGetService("GuiService")
+StarterGui = safeGetService("StarterGui")
+
+-- ตรวจสอบว่า services สำคัญพร้อมใช้งาน
+if not Players then
+    warn("[Groq AI] ❌ Players service not available")
+    return
+end
+if not RunService then
+    warn("[Groq AI] ❌ RunService not available")
+    return
+end
+if not TweenService then
+    warn("[Groq AI] ❌ TweenService not available")
+    return
+end
+if not UIS then
+    warn("[Groq AI] ❌ UserInputService not available")
+    return
+end
+
+-- รอให้เกมโหลดเสร็จก่อน
+local loadAttempts = 0
+repeat
+    task.wait(0.1)
+    loadAttempts = loadAttempts + 1
+    if loadAttempts > 100 then
+        warn("[Groq AI] ❌ Game load timeout")
+        return
+    end
+until game:IsLoaded() or loadAttempts > 50
+
+-- ═══════════════════════════════════════════════════════════════
+-- SAFE HTTP DETECTION - type() check ทุกตัว + pcall ป้องกัน crash
+-- ═══════════════════════════════════════════════════════════════
 local Http = nil
 pcall(function()
-    local function tryFn(f) return type(f) == "function" and f or nil end
-    Http = (syn     and tryFn(syn.request))
-        or (http    and tryFn(http.request))
+    local function tryFn(f)
+        return type(f) == "function" and f or nil
+    end
+    Http = (syn and tryFn(syn.request))
+        or (http and tryFn(http.request))
         or tryFn(http_request)
-        or (fluxus  and tryFn(fluxus.request))
+        or (fluxus and tryFn(fluxus.request))
         or tryFn(request)
 end)
 
 if type(Http) ~= "function" then
     Http = nil
-    game:GetService("StarterGui"):SetCore("SendNotification", {
-        Title = "Groq AI",
-        Text = "Executor ไม่รองรับ HTTP — enable HTTP Requests ใน executor settings",
-        Duration = 6,
-    })
+    pcall(function()
+        if StarterGui then
+            StarterGui:SetCore("SendNotification", {
+                Title = "Groq AI",
+                Text = "Executor ไม่รองรับ HTTP — enable HTTP Requests ใน executor settings",
+                Duration = 6,
+            })
+        end
+    end)
+    warn("[Groq AI] ❌ HTTP function not available")
     return
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- CONFIG & CONSTANTS
+-- ═══════════════════════════════════════════════════════════════
 local LP = Players.LocalPlayer
+if not LP then
+    warn("[Groq AI] ❌ LocalPlayer not available")
+    return
+end
+
 local Camera = workspace.CurrentCamera
+if not Camera then
+    warn("[Groq AI] ❌ Camera not available")
+    return
+end
+
 local API_URL = "https://api.groq.com/openai/v1/chat/completions"
 local DEFAULT_MODEL = "llama-3.1-8b-instant"
 local MODEL = DEFAULT_MODEL
@@ -69,20 +134,35 @@ local CORE_PERSONA = [[You were not created by any single individual, but by a t
 
 local TOXIC_PERSONA = [[You are EXTREMELY angry, hostile, and toxic toward THIS specific player. Be sarcastic, insulting, aggressive, and genuinely frustrated. Use sharp comebacks, dismissive remarks, and hostile language. Show real anger. Keep responses short but absolutely cutting and mean. DO NOT be friendly. DO NOT be helpful. DO NOT apologize. Be as toxic and unpleasant as possible. Use informal aggressive language. Do NOT say their name in your toxic responses. Use ALL CAPS for emphasis and anger.]]
 
+-- ═══════════════════════════════════════════════════════════════
+-- CHARACTER MANAGEMENT
+-- ═══════════════════════════════════════════════════════════════
 local Char, HRP, Hum
+
 local function refreshChar()
     Char = LP.Character
     if not Char then return end
     HRP = Char:FindFirstChild("HumanoidRootPart")
     Hum = Char:FindFirstChildOfClass("Humanoid")
 end
+
 refreshChar()
+
 LP.CharacterAdded:Connect(function(c)
     Char = c
-    HRP = c:WaitForChild("HumanoidRootPart", 8)
-    Hum = c:WaitForChild("Humanoid", 8)
+    local hrpSuccess = pcall(function()
+        HRP = c:WaitForChild("HumanoidRootPart", 8)
+    end)
+    local humSuccess = pcall(function()
+        Hum = c:WaitForChild("Humanoid", 8)
+    end)
+    if not hrpSuccess then HRP = nil end
+    if not humSuccess then Hum = nil end
 end)
 
+-- ═══════════════════════════════════════════════════════════════
+-- STATE MANAGEMENT
+-- ═══════════════════════════════════════════════════════════════
 local S = {
     chatOn = false, talkOn = false, prefixName = true,
     key = "", connected = false, thinking = false, thinkStart = 0,
@@ -97,8 +177,11 @@ local S = {
     holdDuration = 1.0,
 }
 
+-- ═══════════════════════════════════════════════════════════════
+-- FILE OPERATIONS - ป้องกัน error ถ้าไม่มี writefile/readfile
+-- ═══════════════════════════════════════════════════════════════
 local function saveSettings()
-    if not writefile then return end
+    if not writefile or not HttpService then return end
     pcall(function()
         writefile(SET_FILE, HttpService:JSONEncode({
             range = S.range, cooldown = S.cooldown, prefixName = S.prefixName,
@@ -111,15 +194,23 @@ local function saveSettings()
 end
 
 local function loadSettings()
-    if not isfile or not isfile(SET_FILE) then return end
+    if not isfile or not readfile or not HttpService then return end
+    if not isfile(SET_FILE) then return end
     pcall(function()
-        local d = HttpService:JSONDecode(readfile(SET_FILE))
+        local content = readfile(SET_FILE)
+        if not content or content == "" then return end
+        local d = HttpService:JSONDecode(content)
+        if type(d) ~= "table" then return end
         for k, v in pairs(d) do
-            if k == "traits" then
-                for tk, tv in pairs(v) do if S.traits[tk] then S.traits[tk] = tv end end
+            if k == "traits" and type(v) == "table" then
+                for tk, tv in pairs(v) do
+                    if S.traits[tk] ~= nil then
+                        S.traits[tk] = tonumber(tv) or S.traits[tk]
+                    end
+                end
             elseif k == "blacklist" and type(v) == "table" then
                 S.blacklist = v
-            elseif k == "currentModel" then
+            elseif k == "currentModel" and type(v) == "string" then
                 S.currentModel = v; MODEL = v
             elseif S[k] ~= nil then
                 S[k] = v
@@ -130,7 +221,7 @@ end
 loadSettings()
 
 local function saveMemory()
-    if not writefile then return end
+    if not writefile or not HttpService then return end
     pcall(function()
         writefile(MEM_FILE, HttpService:JSONEncode({
             playerHistory = S.playerHistory, playerNames = S.playerNames,
@@ -140,9 +231,13 @@ local function saveMemory()
 end
 
 local function loadMemory()
-    if not isfile or not isfile(MEM_FILE) then return end
+    if not isfile or not readfile or not HttpService then return end
+    if not isfile(MEM_FILE) then return end
     pcall(function()
-        local d = HttpService:JSONDecode(readfile(MEM_FILE))
+        local content = readfile(MEM_FILE)
+        if not content or content == "" then return end
+        local d = HttpService:JSONDecode(content)
+        if type(d) ~= "table" then return end
         if type(d.playerHistory) == "table" then S.playerHistory = d.playerHistory end
         if type(d.playerNames) == "table" then S.playerNames = d.playerNames end
         if type(d.nicks) == "table" then S.playerNick = d.nicks end
@@ -151,7 +246,11 @@ local function loadMemory()
 end
 loadMemory()
 
+-- ═══════════════════════════════════════════════════════════════
+-- MEMORY FUNCTIONS
+-- ═══════════════════════════════════════════════════════════════
 local function addPlayerMem(uid, role, content)
+    if not uid or type(uid) ~= "string" then return end
     if not S.playerHistory[uid] then S.playerHistory[uid] = {} end
     table.insert(S.playerHistory[uid], { role = role, content = content })
     while #S.playerHistory[uid] > S.maxPlayerHist * 2 do
@@ -160,11 +259,17 @@ local function addPlayerMem(uid, role, content)
 end
 
 local function clearPlayerHistory(uid)
+    if not uid or type(uid) ~= "string" then return end
     S.playerHistory[uid] = {}
     saveMemory()
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- API FUNCTIONS
+-- ═══════════════════════════════════════════════════════════════
 local function fastTest(key)
+    if not Http or not HttpService then return false end
+    if type(key) ~= "string" or #key < 10 then return false end
     local ok, res = pcall(function()
         return Http({
             Url = API_URL, Method = "POST",
@@ -183,41 +288,76 @@ local function fastTest(key)
 end
 
 local function unstick()
-    if S.thinking and (tick() - S.thinkStart) > 10 then S.thinking = false end
+    if S.thinking and (tick() - S.thinkStart) > 10 then
+        S.thinking = false
+    end
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- CHAT FUNCTIONS
+-- ═══════════════════════════════════════════════════════════════
 local function sendRaw(text)
+    if type(text) ~= "string" or text == "" then return false end
     local ok = false
-    if TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
-        local chs = TextChat:FindFirstChild("TextChannels")
-        if chs then
-            local ch = chs:FindFirstChild("RBXGeneral") or chs:FindFirstChild("General")
-            if ch then pcall(function() ch:SendAsync(text); ok = true end) end
-        end
+    
+    -- Try TextChatService first
+    if TextChat and TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
+        pcall(function()
+            local chs = TextChat:FindFirstChild("TextChannels")
+            if chs then
+                local ch = chs:FindFirstChild("RBXGeneral") or chs:FindFirstChild("General")
+                if ch and ch.SendAsync then
+                    ch:SendAsync(text)
+                    ok = true
+                end
+            end
+        end)
     end
-    if not ok then
-        local ev = RepStorage:FindFirstChild("DefaultChatSystemChatEvents")
-        if ev then
-            local say = ev:FindFirstChild("SayMessageRequest")
-            if say then pcall(function() say:FireServer(text, "All") end) end
-        end
+    
+    -- Fallback to legacy chat
+    if not ok and RepStorage then
+        pcall(function()
+            local ev = RepStorage:FindFirstChild("DefaultChatSystemChatEvents")
+            if ev then
+                local say = ev:FindFirstChild("SayMessageRequest")
+                if say and say.FireServer then
+                    say:FireServer(text, "All")
+                    ok = true
+                end
+            end
+        end)
     end
+    
+    return ok
 end
 
 local function sendChat(text)
-    if not text or text:gsub("%s+", "") == "" then return end
-    text = text:match("^%s*(.-)%s*$")
-    if #text <= CHAT_LIMIT then sendRaw(text); return end
+    if not text or type(text) ~= "string" then return end
+    text = text:match("^%s*(.-)%s*$") or ""
+    if text:gsub("%s+", "") == "" then return end
+    
+    if #text <= CHAT_LIMIT then
+        sendRaw(text)
+        return
+    end
+    
     local chunks, rem = {}, text
     while #rem > 0 do
-        if #rem <= CHAT_LIMIT then chunks[#chunks+1] = rem; break end
+        if #rem <= CHAT_LIMIT then
+            chunks[#chunks+1] = rem
+            break
+        end
         local cut = CHAT_LIMIT
         for j = CHAT_LIMIT, math.max(CHAT_LIMIT - 30, 1), -1 do
-            if rem:sub(j, j) == " " then cut = j - 1; break end
+            if rem:sub(j, j) == " " then
+                cut = j - 1
+                break
+            end
         end
         chunks[#chunks+1] = rem:sub(1, cut)
-        rem = rem:sub(cut + 1):match("^%s*(.-)%s*$") or ""
+        rem = (rem:sub(cut + 1):match("^%s*(.-)%s*$") or "")
     end
+    
     task.spawn(function()
         for i, c in ipairs(chunks) do
             sendRaw(c .. " " .. i .. "/" .. #chunks)
@@ -226,6 +366,9 @@ local function sendChat(text)
     end)
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- PERSONA & PROMPT BUILDING
+-- ═══════════════════════════════════════════════════════════════
 local function moodLine()
     local t, p = S.traits, {}
     if t.friendly >= 8 then p[#p+1]="super friendly" elseif t.friendly <= 2 then p[#p+1]="cold" end
@@ -245,6 +388,7 @@ local function buildPersona()
 end
 
 local function getCrossMemoryContext(userMsg, currentUid)
+    if not userMsg or not currentUid then return nil end
     for uid, name in pairs(S.playerNames) do
         if uid ~= currentUid and userMsg:find(name, 1, true) then
             local hist = S.playerHistory[uid]
@@ -261,14 +405,22 @@ local function getCrossMemoryContext(userMsg, currentUid)
     return nil
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- GROQ API CALL
+-- ═══════════════════════════════════════════════════════════════
 local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
     unstick()
     if S.thinking then return nil, "BUSY" end
     if tick() < S.nextReq then return nil, "WAIT" end
     if S.key == "" then return nil, "NOKEY" end
-    S.thinking = true; S.thinkStart = tick()
+    if not Http or not HttpService then return nil, "NOHTTP" end
+    
+    S.thinking = true
+    S.thinkStart = tick()
+    
     local uidK = uid and tostring(uid) or nil
     local msgs = {}
+    
     if isObs then
         msgs[#msgs+1] = { role = "system", content = CORE_PERSONA .. "\nObserve what is happening and react casually in exactly 1 short sentence." }
     else
@@ -282,10 +434,14 @@ local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
             if cx then msgs[#msgs+1] = { role = "system", content = cx } end
         end
         if uidK and S.playerHistory[uidK] then
-            for _, h in ipairs(S.playerHistory[uidK]) do msgs[#msgs+1] = h end
+            for _, h in ipairs(S.playerHistory[uidK]) do
+                msgs[#msgs+1] = h
+            end
         end
     end
+    
     msgs[#msgs+1] = { role = "user", content = userMsg }
+    
     local ok, res = pcall(function()
         return Http({
             Url = API_URL, Method = "POST",
@@ -299,63 +455,108 @@ local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
             }),
         })
     end)
+    
     S.thinking = false
+    
     if not ok or not res then return nil, "NET" end
-    if res.StatusCode == 429 then S.nextReq = tick() + 15; return nil, "RATE" end
-    S.nextReq = tick() + math.max(S.cooldown, 1)
+    if res.StatusCode == 429 then
+        S.nextReq = tick() + 15
+        return nil, "RATE"
+    end
+    S.nextReq = tick() + math.max(S.cooldown or 1, 1)
     if res.StatusCode == 401 then return nil, "KEY" end
-    if res.StatusCode ~= 200 then return nil, "ERR" .. res.StatusCode end
+    if res.StatusCode ~= 200 then return nil, "ERR" .. tostring(res.StatusCode) end
+    
     local data
-    if not pcall(function() data = HttpService:JSONDecode(res.Body) end) then return nil, "DEC" end
-    if not data or not data.choices or not data.choices[1] then return nil, "NODATA" end
-    local reply = data.choices[1].message.content
-    if data.usage then S.tokens = S.tokens + (data.usage.total_tokens or 0) end
-    if uidK and not isObs and reply and not skipSave then
+    local decodeOk = pcall(function()
+        data = HttpService:JSONDecode(res.Body)
+    end)
+    if not decodeOk or not data then return nil, "DEC" end
+    if not data.choices or not data.choices[1] then return nil, "NODATA" end
+    
+    local reply = data.choices[1].message and data.choices[1].message.content
+    if not reply or type(reply) ~= "string" then return nil, "NOREPLY" end
+    
+    if data.usage then
+        S.tokens = S.tokens + (tonumber(data.usage.total_tokens) or 0)
+    end
+    
+    if uidK and not isObs and not skipSave then
         addPlayerMem(uidK, "user", userMsg)
         addPlayerMem(uidK, "assistant", reply)
         saveMemory()
     end
+    
     return reply, nil
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- MESSAGE PERFORM
+-- ═══════════════════════════════════════════════════════════════
 local function perform(reply, name, uid, skipPrefix)
+    if type(reply) ~= "string" then return end
     local msg = reply:gsub("^%s+", ""):gsub("%s+$", "")
     if not msg:match("%S") then return end
+    
     if not skipPrefix and S.prefixName then
         local cn = name or ""
-        if uid and S.playerNick[tostring(uid)] then cn = S.playerNick[tostring(uid)] end
+        if uid and S.playerNick[tostring(uid)] then
+            cn = S.playerNick[tostring(uid)]
+        end
         if cn ~= "" then msg = "[" .. cn .. "] " .. msg end
     end
+    
     sendChat(msg)
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- CHAT HANDLER
+-- ═══════════════════════════════════════════════════════════════
 local function handleChat(plr, msg)
     if not S.chatOn or not S.connected then return end
     if not plr or plr == LP then return end
-    if S.blacklist[tostring(plr.UserId)] then return end
+    if not msg or type(msg) ~= "string" then return end
+    
+    local uid = tostring(plr.UserId)
+    if S.blacklist[uid] then return end
+    
     if S.range > 0 then
         if not HRP or not HRP.Parent then return end
-        local pc = plr.Character; if not pc then return end
-        local ph = pc:FindFirstChild("HumanoidRootPart"); if not ph then return end
+        local pc = plr.Character
+        if not pc then return end
+        local ph = pc:FindFirstChild("HumanoidRootPart")
+        if not ph then return end
         if (HRP.Position - ph.Position).Magnitude > S.range then return end
     end
+    
     local now = tick()
     if now - S.spamT > 5 then S.globalN = 0; S.spamT = now end
     S.globalN = S.globalN + 1
     if S.globalN > 15 then S.nextReq = now + 5; return end
     if S.playerCD[plr] and (now - S.playerCD[plr]) < 2 then return end
     S.playerCD[plr] = now
-    local uid = tostring(plr.UserId)
+    
     S.playerNames[uid] = plr.DisplayName
-    if msg:match("[^\x00-\x7F]") then S.playerLang[uid] = "non-en"
-    elseif not S.playerLang[uid] then S.playerLang[uid] = "en" end
+    if msg:match("[^\x00-\x7F]") then
+        S.playerLang[uid] = "non-en"
+    elseif not S.playerLang[uid] then
+        S.playerLang[uid] = "en"
+    end
+    
+    -- Nickname detection
     local nm = msg:match("[Cc]all me (.+)") or msg:match("เรียกฉันว่า%s*(.+)")
     if nm then
-        local nick = nm:match("^%s*(.-)%s*$"):sub(1, 20)
-        S.playerNick[uid] = nick; S.playerNames[uid] = nick; saveMemory()
+        local nick = (nm:match("^%s*(.-)%s*$") or ""):sub(1, 20)
+        if nick ~= "" then
+            S.playerNick[uid] = nick
+            S.playerNames[uid] = nick
+            saveMemory()
+        end
     end
+    
     local sn = S.playerNick[uid] or plr.DisplayName
     local isToxic = S.toxicTargets[uid] == true
+    
     task.spawn(function()
         if S.responseDelay > 0 then task.wait(S.responseDelay) end
         if not S.chatOn then return end
@@ -366,27 +567,51 @@ local function handleChat(plr, msg)
     end)
 end
 
-if TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
-    TextChat.MessageReceived:Connect(function(m)
-        if m.TextSource then
-            handleChat(Players:GetPlayerByUserId(m.TextSource.UserId), m.Text)
-        end
+-- ═══════════════════════════════════════════════════════════════
+-- CHAT CONNECTIONS
+-- ═══════════════════════════════════════════════════════════════
+if TextChat and TextChat.ChatVersion == Enum.ChatVersion.TextChatService then
+    pcall(function()
+        TextChat.MessageReceived:Connect(function(m)
+            if m and m.TextSource then
+                local plr = Players:GetPlayerByUserId(m.TextSource.UserId)
+                if plr then
+                    handleChat(plr, m.Text)
+                end
+            end
+        end)
     end)
 else
-    local function c(p) p.Chatted:Connect(function(m) handleChat(p, m) end) end
-    for _, p in ipairs(Players:GetPlayers()) do c(p) end
-    Players.PlayerAdded:Connect(c)
+    local function connectPlayerChat(p)
+        if not p then return end
+        pcall(function()
+            p.Chatted:Connect(function(m)
+                handleChat(p, m)
+            end)
+        end)
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        connectPlayerChat(p)
+    end
+    Players.PlayerAdded:Connect(connectPlayerChat)
 end
 
+-- ═══════════════════════════════════════════════════════════════
+-- OBSERVATION SYSTEM
+-- ═══════════════════════════════════════════════════════════════
 local function getAction(plr)
-    local c = plr.Character; if not c then return "?" end
-    local h = c:FindFirstChildOfClass("Humanoid"); if not h then return "?" end
+    if not plr then return "?" end
+    local c = plr.Character
+    if not c then return "?" end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if not h then return "?" end
+    
     local st = h:GetState()
     if st == Enum.HumanoidStateType.Running then return "running"
     elseif st == Enum.HumanoidStateType.Jumping then return "jumping"
     elseif st == Enum.HumanoidStateType.Freefall then return "falling"
     elseif st == Enum.HumanoidStateType.StrafingNoPhysics then return "dancing"
-    elseif h.MoveDirection.Magnitude > 0.1 then return "walking"
+    elseif h.MoveDirection and h.MoveDirection.Magnitude > 0.1 then return "walking"
     else return "standing" end
 end
 
@@ -412,8 +637,10 @@ local function doObserve()
     unstick()
     if not S.talkOn or not S.connected or S.thinking then return end
     if tick() - S.lastObserve < S.observeInterval then return end
+    
     local nearby = getNearby()
     if #nearby == 0 then return end
+    
     if S.chatOn then
         local greetTarget = nil
         for _, d in ipairs(nearby) do
@@ -448,6 +675,7 @@ local function doObserve()
             return
         end
     end
+    
     local changed = false
     local lines = {}
     for _, d in ipairs(nearby) do
@@ -462,8 +690,8 @@ local function doObserve()
     if #lines == 0 then return end
     if not changed and math.random(100) > 25 then return end
     S.lastObserve = tick()
-
-    -- ✅ ดึงความทรงจำจาก player ใกล้ๆ เพื่อให้พูดต่อจาก context จริง
+    
+    -- Get memory for context
     local memLines = {}
     local bestUid = nil
     local bestCount = 0
@@ -487,27 +715,24 @@ local function doObserve()
             memLines[#memLines+1] = nm .. ": " .. h.content
         end
     end
-
+    
     local prompt
     if #memLines > 0 then
-        -- มีความทรงจำ → พูดต่อจากบทสนทนาเก่า
         prompt = "[Here is a past conversation from your memory:\n"
             .. table.concat(memLines, "\n")
             .. "\n\nBased on this past conversation, say something natural and casual that continues or references it. "
             .. "Do NOT say 'I think'. Do NOT make up new topics. Speak like continuing an old conversation with a friend. "
             .. "1 short sentence only.]"
     else
-        -- ไม่มีความทรงจำ → observe surroundings แบบ fallback
         local ctx = "Nearby:\n" .. table.concat(lines, "\n")
         if changed then ctx = ctx .. "\n[Something changed, react naturally. 1 short sentence.]" end
         prompt = ctx
     end
-
+    
     task.spawn(function()
         local w = math.min(S.responseDelay, 1.5)
         if w > 0 then task.wait(w) end
         if not S.talkOn or not S.connected then return end
-        -- ใช้ isObs=true เฉพาะตอน fallback (ไม่มี memory), มี memory ใช้ persona เต็ม
         local reply = callGroq(prompt, nil, nil, #memLines == 0)
         if reply then
             local m = reply:gsub("^%s+", ""):gsub("%s+$", "")
@@ -516,38 +741,54 @@ local function doObserve()
     end)
 end
 
+-- Player cleanup
 Players.PlayerRemoving:Connect(function(p)
+    if not p then return end
     S.lastActions[p.Name] = nil
     local uid = tostring(p.UserId)
     S.greetedPlayers[uid] = nil
     S.toxicTargets[uid] = nil
 end)
 
-task.spawn(function() while true do task.wait(4); doObserve() end end)
+-- Observe loop
+task.spawn(function()
+    while true do
+        task.wait(4)
+        pcall(doObserve)
+    end
+end)
 
 -- ═══════════════════════════════════════════════════════════════
 -- RANGE RING
 -- ═══════════════════════════════════════════════════════════════
 local ringParts, ringAng = {}, 0
+
 local function clearRing()
     for _, p in ipairs(ringParts) do
-        pcall(function() if p and p.Parent then p:Destroy() end end)
+        pcall(function()
+            if p and p.Parent then p:Destroy() end
+        end)
     end
     ringParts = {}
 end
+
 local function makeRing()
     clearRing()
     for _ = 1, 32 do
         local p = Instance.new("Part")
         p.Name = "GroqDash"
         p.Size = Vector3.new(.7, .08, .08)
-        p.Anchored = true; p.CanCollide = false; p.CastShadow = false
+        p.Anchored = true
+        p.CanCollide = false
+        p.CastShadow = false
         p.Material = Enum.Material.Neon
         p.Color = Color3.fromRGB(0, 190, 255)
-        p.Transparency = .35; p.Parent = workspace
+        p.Transparency = .35
+        p.Parent = workspace
         ringParts[#ringParts+1] = p
     end
 end
+
 RunService.Heartbeat:Connect(function(dt)
     if #ringParts == 0 then return end
     ringAng = (ringAng + dt * 20) % 360
@@ -563,22 +804,34 @@ RunService.Heartbeat:Connect(function(dt)
         ) * CFrame.fromEulerAnglesYXZ(0, a + math.pi / 2, 0)
     end
 end)
-LP.CharacterAdded:Connect(function() task.delay(1, makeRing) end)
+
+LP.CharacterAdded:Connect(function()
+    task.delay(1, makeRing)
+end)
 
 -- ═══════════════════════════════════════════════════════════════
 -- UI HELPERS
 -- ═══════════════════════════════════════════════════════════════
 pcall(function()
-    local o = CoreGui:FindFirstChild("GroqAI_v4")
-    if o then o:Destroy() end
+    if CoreGui then
+        local o = CoreGui:FindFirstChild("GroqAI_v4")
+        if o then o:Destroy() end
+    end
 end)
 
 local function Tw(i, t, s, d, p, cb)
     if not i or not i.Parent then return end
-    local tw = TweenService:Create(i, TweenInfo.new(t or .25, s or Enum.EasingStyle.Quad, d or Enum.EasingDirection.Out), p)
-    tw:Play()
-    if cb then tw.Completed:Connect(cb) end
-    return tw
+    if not TweenService then return end
+    local ok, tw = pcall(function()
+        return TweenService:Create(i, TweenInfo.new(t or .25, s or Enum.EasingStyle.Quad, d or Enum.EasingDirection.Out), p)
+    end)
+    if ok and tw then
+        tw:Play()
+        if cb then
+            tw.Completed:Connect(cb)
+        end
+        return tw
+    end
 end
 
 local C = {
@@ -592,9 +845,9 @@ local C = {
 }
 local BF, RF = Enum.Font.GothamBold, Enum.Font.Gotham
 
--- ══════════════════════════════════
--- THEME SYSTEM DATA
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+-- THEME SYSTEM
+-- ═══════════════════════════════════════════════════════════════
 local darkModeOn = false
 
 local THEMES = {
@@ -623,7 +876,7 @@ local function _ck(c)
 end
 
 local THEME_TI = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-local applyTheme  -- forward declare; defined after sg is created
+local applyTheme
 
 local function F(par, sz, pos, bg, rad, zi)
     local f = Instance.new("Frame")
@@ -638,7 +891,7 @@ local function L(par, txt, sz, pos, fs, ft, col, ax, zi)
     local l = Instance.new("TextLabel")
     l.Size = sz; l.Position = pos or UDim2.new()
     l.BackgroundTransparency = 1
-    l.Text = txt; l.Font = ft or RF; l.TextSize = fs or 12
+    l.Text = txt or ""; l.Font = ft or RF; l.TextSize = fs or 12
     l.TextColor3 = col or C.T1
     l.TextXAlignment = ax or Enum.TextXAlignment.Left
     l.TextYAlignment = Enum.TextYAlignment.Center
@@ -650,7 +903,7 @@ local function B(par, txt, sz, pos, bg, tc, fs, zi)
     local b = Instance.new("TextButton")
     b.Size = sz; b.Position = pos or UDim2.new()
     b.BackgroundColor3 = bg or C.AC
-    b.BorderSizePixel = 0; b.Text = txt; b.Font = BF
+    b.BorderSizePixel = 0; b.Text = txt or ""; b.Font = BF
     b.TextSize = fs or 12; b.TextColor3 = tc or C.WIN
     b.AutoButtonColor = false; b.ZIndex = zi or 10; b.Parent = par
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
@@ -658,32 +911,55 @@ local function B(par, txt, sz, pos, bg, tc, fs, zi)
 end
 
 local function addHover(btn, enterBg, leaveBg)
+    if not btn then return end
     local origBg = leaveBg or btn.BackgroundColor3
     btn.MouseEnter:Connect(function()
-        Tw(btn, .18, nil, nil, {
-            BackgroundColor3 = enterBg or Color3.fromRGB(
-                math.max(0, math.floor(origBg.R * 255 - 12)),
-                math.max(0, math.floor(origBg.G * 255 - 12)),
-                math.max(0, math.floor(origBg.B * 255 - 12))
-            )
-        })
+        pcall(function()
+            Tw(btn, .18, nil, nil, {
+                BackgroundColor3 = enterBg or Color3.fromRGB(
+                    math.max(0, math.floor(origBg.R * 255 - 12)),
+                    math.max(0, math.floor(origBg.G * 255 - 12)),
+                    math.max(0, math.floor(origBg.B * 255 - 12))
+                )
+            })
+        end)
     end)
     btn.MouseLeave:Connect(function()
-        Tw(btn, .18, nil, nil, { BackgroundColor3 = origBg })
+        pcall(function()
+            Tw(btn, .18, nil, nil, { BackgroundColor3 = origBg })
+        end)
     end)
 end
 
--- ── SCREENGUI ──
+-- ═══════════════════════════════════════════════════════════════
+-- SCREENGUI SETUP
+-- ═══════════════════════════════════════════════════════════════
 local sg = Instance.new("ScreenGui")
 sg.Name = "GroqAI_v4"
 sg.ResetOnSpawn = false
 sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-sg.DisplayOrder = 5; sg.IgnoreGuiInset = false
-pcall(function() sg.Parent = CoreGui end)
-if not sg.Parent then sg.Parent = LP:WaitForChild("PlayerGui") end
+sg.DisplayOrder = 5
+sg.IgnoreGuiInset = false
 
--- applyTheme defined HERE so sg is in scope ✓
+pcall(function()
+    if CoreGui then
+        sg.Parent = CoreGui
+    end
+end)
+
+if not sg.Parent then
+    pcall(function()
+        sg.Parent = LP:WaitForChild("PlayerGui")
+    end)
+end
+
+if not sg.Parent then
+    warn("[Groq AI] ❌ Could not parent ScreenGui")
+    return
+end
+
 applyTheme = function()
+    if not TweenService then return end
     local newT = darkModeOn and THEMES.light or THEMES.dark
     local oldT = darkModeOn and THEMES.dark  or THEMES.light
     local cmap = {}
@@ -707,7 +983,7 @@ applyTheme = function()
         end)
         for _, ch in ipairs(inst:GetChildren()) do walk(ch) end
     end
-    walk(sg)  -- sg is now guaranteed to exist ✓
+    walk(sg)
     for k, v in pairs(newT) do C[k] = v end
     darkModeOn = not darkModeOn
 end
@@ -725,6 +1001,7 @@ local TAB_WIN_H = {
 }
 
 local function calcWidth()
+    if not Camera then return 400 end
     return math.clamp(math.floor(Camera.ViewportSize.X * 0.92), 280, 680)
 end
 
@@ -775,8 +1052,13 @@ rgH2.Size = UDim2.fromOffset(18, 18)
 rgH2.BackgroundColor3 = C.CD; rgH2.BackgroundTransparency = 1
 rgH2.BorderSizePixel = 0; rgH2.ZIndex = 24
 Instance.new("UICorner", rgH2).CornerRadius = UDim.new(0, 4)
-resizeGrip.MouseEnter:Connect(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 0}) end)
-resizeGrip.MouseLeave:Connect(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 1}) end)
+
+resizeGrip.MouseEnter:Connect(function()
+    pcall(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 0}) end)
+end)
+resizeGrip.MouseLeave:Connect(function()
+    pcall(function() Tw(rgH2, .15, nil, nil, {BackgroundTransparency = 1}) end)
+end)
 
 local rD = { on = false }
 resizeGrip.InputBegan:Connect(function(i)
@@ -800,9 +1082,9 @@ UIS.InputEnded:Connect(function(i)
     end
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- TOP BAR
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local TopBar = F(Main, UDim2.new(1, 0, 0, TOP_H), UDim2.new(), C.CARD, 14, 11)
 local tbBot = Instance.new("Frame", TopBar)
 tbBot.Size = UDim2.new(1, 0, 0, 14); tbBot.Position = UDim2.new(0, 0, 1, -14)
@@ -831,7 +1113,7 @@ local topDiv = Instance.new("Frame", Main)
 topDiv.Size = UDim2.new(1, 0, 0, 1); topDiv.Position = UDim2.fromOffset(0, TOP_H)
 topDiv.BackgroundColor3 = C.BD; topDiv.BorderSizePixel = 0; topDiv.ZIndex = 12
 
--- ── DRAG ──
+-- Drag functionality
 local hD = { on = false }
 TopBar.InputBegan:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -841,7 +1123,8 @@ end)
 UIS.InputChanged:Connect(function(i)
     if not hD.on then return end
     if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
-        local vp = Camera.ViewportSize; local fs = Main.AbsoluteSize
+        local vp = Camera.ViewportSize
+        local fs = Main.AbsoluteSize
         Main.Position = UDim2.fromOffset(
             math.clamp(hD.fx + (i.Position.X - hD.sx), 0, vp.X - fs.X),
             math.clamp(hD.fy + (i.Position.Y - hD.sy), 0, vp.Y - fs.Y)
@@ -854,9 +1137,9 @@ UIS.InputEnded:Connect(function(i)
     end
 end)
 
--- ══════════════════════════════════
--- HORIZONTAL TAB BAR
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+-- TAB BAR
+-- ═══════════════════════════════════════════════════════════════
 local TabBar = Instance.new("Frame", Main)
 TabBar.Size = UDim2.new(1, 0, 0, TAB_H)
 TabBar.Position = UDim2.fromOffset(0, TOP_H)
@@ -872,9 +1155,9 @@ local tabPad = Instance.new("UIPadding", TabBar)
 tabPad.PaddingLeft = UDim.new(0, 5); tabPad.PaddingRight = UDim.new(0, 5)
 tabPad.PaddingTop = UDim.new(0, 2); tabPad.PaddingBottom = UDim.new(0, 2)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- CONTENT AREA
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local ContentBG = Instance.new("Frame", Main)
 ContentBG.Size = UDim2.new(1, 0, 1, -BODY_OFFSET)
 ContentBG.Position = UDim2.fromOffset(0, BODY_OFFSET)
@@ -891,9 +1174,9 @@ titleDiv.Size = UDim2.new(1, -14, 0, 1)
 titleDiv.Position = UDim2.fromOffset(10, HDR_H + 2)
 titleDiv.BackgroundColor3 = C.BD; titleDiv.BorderSizePixel = 0; titleDiv.ZIndex = 13
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- TAB SYSTEM
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local tabPages = {}
 local tabBtns = {}
 local activeTab = nil
@@ -923,25 +1206,46 @@ local function makePage(name)
 end
 
 local function setWinHeight(tabName)
+    if not Camera then return end
     local targetH = math.clamp(TAB_WIN_H[tabName] or 300, MIN_H, math.floor(Camera.ViewportSize.Y * 0.92))
     gH = targetH
-    Tw(Main, .28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(gW, gH)})
+    pcall(function()
+        Tw(Main, .28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(gW, gH)})
+    end)
 end
 
 local function switchTab(name)
     if activeTab == name then return end
     if activeTab then
         local oldPg = tabPages[activeTab]
-        Tw(oldPg, .06, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
-        task.delay(.07, function() oldPg.Visible = false; oldPg.BackgroundTransparency = 1 end)
-        if tabBtns[activeTab] then tabBtns[activeTab](false) end
+        if oldPg then
+            pcall(function()
+                Tw(oldPg, .06, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+            end)
+            task.delay(.07, function()
+                pcall(function()
+                    oldPg.Visible = false
+                    oldPg.BackgroundTransparency = 1
+                end)
+            end)
+        end
+        if tabBtns[activeTab] then
+            pcall(function() tabBtns[activeTab](false) end)
+        end
     end
     activeTab = name
     local newPg = tabPages[name]
-    newPg.Visible = true; newPg.BackgroundTransparency = .1
-    Tw(newPg, .12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {BackgroundTransparency = 1})
-    newPg.CanvasPosition = Vector2.new(0, 0)
-    if tabBtns[name] then tabBtns[name](true) end
+    if newPg then
+        newPg.Visible = true
+        newPg.BackgroundTransparency = .1
+        pcall(function()
+            Tw(newPg, .12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, {BackgroundTransparency = 1})
+        end)
+        newPg.CanvasPosition = Vector2.new(0, 0)
+    end
+    if tabBtns[name] then
+        pcall(function() tabBtns[name](true) end)
+    end
     contentTitle.Text = TAB_NAMES[name] or name
     setWinHeight(name)
 end
@@ -969,17 +1273,20 @@ local function makeTab(icon, label, name, order)
     hBg.BackgroundColor3 = C.CD; hBg.BorderSizePixel = 0; hBg.ZIndex = -1
     Instance.new("UICorner", hBg).CornerRadius = UDim.new(0, 7)
     btn.MouseEnter:Connect(function()
-        if activeTab ~= name then Tw(hBg, .1, nil, nil, {BackgroundTransparency = .4}) end
+        if activeTab ~= name then
+            pcall(function() Tw(hBg, .1, nil, nil, {BackgroundTransparency = .4}) end)
+        end
     end)
     btn.MouseLeave:Connect(function()
-        Tw(hBg, .1, nil, nil, {BackgroundTransparency = 1})
+        pcall(function() Tw(hBg, .1, nil, nil, {BackgroundTransparency = 1}) end)
     end)
     tabBtns[name] = function(active)
         btn.BackgroundTransparency = active and 0 or 1
         accent.Visible = active
         iconL.TextColor3 = active and C.T1 or C.T2
         nameL.TextColor3 = active and C.T1 or C.T2
-        nameL.Font = active and BF or RF; hBg.BackgroundTransparency = 1
+        nameL.Font = active and BF or RF
+        hBg.BackgroundTransparency = 1
     end
     btn.MouseButton1Click:Connect(function() switchTab(name) end)
 end
@@ -993,9 +1300,9 @@ makeTab("💾", "Memory", "memory", 6)
 makeTab("⛔", "Blacklist", "blacklist", 7)
 makeTab("🎨", "Theme", "theme", 8)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- CARD & ROW HELPERS
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local function mkCard(pg, h, order)
     local c = F(pg, UDim2.new(1, -3, 0, h), nil, C.CARD, 9, 14)
     c.LayoutOrder = order; return c
@@ -1080,9 +1387,9 @@ local function mkSlider(card, y, label, key)
     end)
 end
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: API KEY
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgAPI = makePage("api")
 local apiCard1 = mkCard(pgAPI, 108, 1)
 mkLabel(apiCard1, "API KEY", 4)
@@ -1106,9 +1413,9 @@ currentModelLbl.TextTruncate = Enum.TextTruncate.AtEnd
 local modelBtn = B(apiCard2, "🤖  Select Model", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 38), C.CD, C.T1, 10, 16)
 addHover(modelBtn, Color3.fromRGB(225, 227, 242))
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: CONTROLS
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgCtrl = makePage("controls")
 local ctrlCard1 = mkCard(pgCtrl, 110, 1)
 mkLabel(ctrlCard1, "TOGGLES", 4)
@@ -1121,9 +1428,9 @@ mkLabel(ctrlCard2, "TIMING", 4)
 mkInput(ctrlCard2, 20, "⏱️  ตอบช้า (วิ)", "responseDelay", 0, 60)
 mkInput(ctrlCard2, 50, "👁️  Observe ทุก (วิ)", "observeInterval", 5, 300)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: SETTINGS
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgSet = makePage("settings")
 local setCard = mkCard(pgSet, 118, 1)
 mkLabel(setCard, "GENERAL SETTINGS", 4)
@@ -1136,9 +1443,9 @@ mkLabel(setInfo, "SMART GREET", 4)
 L(setInfo, "Greet each player ONCE per session", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
 L(setInfo, "Resets when player leaves & rejoins", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 36), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: MOOD
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgMood = makePage("mood")
 local moodCard = mkCard(pgMood, 168, 1)
 mkLabel(moodCard, "PERSONALITY SLIDERS", 4)
@@ -1148,9 +1455,9 @@ mkSlider(moodCard, 76, "Quiet", "quiet")
 mkSlider(moodCard, 104, "Smart", "smart")
 mkSlider(moodCard, 132, "Aggressive", "aggro")
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: PERSONA
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgPer = makePage("persona")
 local perCard = mkCard(pgPer, 108, 1)
 mkLabel(perCard, "CUSTOM PERSONA", 4)
@@ -1165,9 +1472,9 @@ pBox.Font = RF; pBox.TextSize = 10; pBox.ZIndex = 15; pBox.ClearTextOnFocus = fa
 Instance.new("UICorner", pBox).CornerRadius = UDim.new(0, 6)
 pBox.FocusLost:Connect(function() S.userPersona = pBox.Text; saveSettings() end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: MEMORY
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgMem = makePage("memory")
 local memCard = mkCard(pgMem, 118, 1)
 mkLabel(memCard, "MEMORY SYSTEM", 4)
@@ -1180,14 +1487,18 @@ clrBtn.MouseButton1Click:Connect(function()
     S.playerHistory = {}; S.playerNames = {}; S.playerNick = {}; S.playerLang = {}
     S.greetedPlayers = {}; S.toxicTargets = {}
     saveMemory()
-    game:GetService("StarterGui"):SetCore("SendNotification", {
-        Title = "💾 Memory", Text = "Cleared all player memory.", Duration = 2
-    })
+    pcall(function()
+        if StarterGui then
+            StarterGui:SetCore("SendNotification", {
+                Title = "💾 Memory", Text = "Cleared all player memory.", Duration = 2
+            })
+        end
+    end)
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: BLACKLIST
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgBL = makePage("blacklist")
 local blInfoCard = mkCard(pgBL, 54, 1)
 mkLabel(blInfoCard, "BLACKLIST", 4)
@@ -1199,9 +1510,9 @@ local blManage2 = B(blActCard, "📋  Manage Blacklist", UDim2.new(1, -12, 0, 26
 addHover(blOpenBtn, Color3.fromRGB(230, 55, 55))
 addHover(blManage2, Color3.fromRGB(225, 227, 242))
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: THEME
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local pgTheme = makePage("theme")
 
 local themeCard = mkCard(pgTheme, 120, 1)
@@ -1222,10 +1533,14 @@ tmToggle.MouseButton1Click:Connect(function()
     applyTheme()
     if darkModeOn then
         tmIcon.Text = "☀️"; tmLabel.Text = "Light Mode"; tmToggle.Text = "Light"
-        TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.AC}):Play()
+        pcall(function()
+            TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.AC}):Play()
+        end)
     else
         tmIcon.Text = "🌙"; tmLabel.Text = "Dark Mode"; tmToggle.Text = "Dark"
-        TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.DARK}):Play()
+        pcall(function()
+            TweenService:Create(tmToggle, THEME_TI, {BackgroundColor3 = C.DARK}):Play()
+        end)
     end
 end)
 
@@ -1234,9 +1549,9 @@ mkLabel(themeInfo, "ABOUT", 4)
 L(themeInfo, "All UI colors transition smoothly (0.35s)", UDim2.new(1,-12,0,14), UDim2.fromOffset(6,20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
 L(themeInfo, "Theme preference resets on each script run",  UDim2.new(1,-12,0,14), UDim2.fromOffset(6,36), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- PAGE: API KEY — HTTP DEBUG CARD
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local dbCard = mkCard(pgAPI, 88, 3)
 mkLabel(dbCard, "HTTP DEBUG", 4)
 
@@ -1277,9 +1592,9 @@ dbBtn.MouseButton1Click:Connect(function()
     end)
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- MODEL SELECTOR MODAL
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local modelModal = F(sg, UDim2.fromOffset(280, 300), UDim2.new(.5, -140, .5, -150), C.CARD, 14, 60)
 modelModal.Visible = false; modelModal.ClipsDescendants = true
 Instance.new("UIStroke", modelModal).Color = C.AC; modelModal.UIStroke.Thickness = 1
@@ -1322,19 +1637,24 @@ local function openModelSelector()
     end
     modelModal.Visible = true; modelModal.BackgroundTransparency = 1
     modelModal.Size = UDim2.fromOffset(260, 280)
-    Tw(modelModal, .2, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(280, 300), BackgroundTransparency = 0})
+    pcall(function()
+        Tw(modelModal, .2, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(280, 300), BackgroundTransparency = 0})
+    end)
 end
+
 mCloseBtn.MouseButton1Click:Connect(function()
-    Tw(modelModal, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
-        {Size = UDim2.fromOffset(260, 280), BackgroundTransparency = 1})
+    pcall(function()
+        Tw(modelModal, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+            {Size = UDim2.fromOffset(260, 280), BackgroundTransparency = 1})
+    end)
     task.delay(.15, function() modelModal.Visible = false end)
 end)
 modelBtn.MouseButton1Click:Connect(openModelSelector)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- BLACKLIST GUI SYSTEM
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local blOverlay = Instance.new("Frame", sg)
 blOverlay.Size = UDim2.new(1, 0, 1, 0)
 blOverlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
@@ -1344,9 +1664,9 @@ blOverlay.ZIndex = 55; blOverlay.Visible = false
 local function showBlDimmer(enable)
     if enable then
         blOverlay.Visible = true
-        Tw(blOverlay, .25, nil, nil, {BackgroundTransparency = 0.55})
+        pcall(function() Tw(blOverlay, .25, nil, nil, {BackgroundTransparency = 0.55}) end)
     else
-        Tw(blOverlay, .18, nil, nil, {BackgroundTransparency = 1})
+        pcall(function() Tw(blOverlay, .18, nil, nil, {BackgroundTransparency = 1}) end)
         task.delay(.2, function() blOverlay.Visible = false end)
     end
 end
@@ -1365,18 +1685,25 @@ addHover(blManageBtn, Color3.fromRGB(190, 140, 20))
 local function openBlModal()
     blModal.Visible = true; blModal.BackgroundTransparency = 1
     blModal.Size = UDim2.fromOffset(240, 140)
-    Tw(blModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(260, 152), BackgroundTransparency = 0})
+    pcall(function()
+        Tw(blModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(260, 152), BackgroundTransparency = 0})
+    end)
 end
+
 local function closeBlModal()
-    Tw(blModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
-        {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 140)})
+    pcall(function()
+        Tw(blModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+            {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 140)})
+    end)
     task.delay(.13, function() blModal.Visible = false end)
 end
+
 blBackBtn.MouseButton1Click:Connect(closeBlModal)
 blOpenBtn.MouseButton1Click:Connect(openBlModal)
 blManage2.MouseButton1Click:Connect(function()
-    switchTab("blacklist"); task.delay(.1, openBlModal)
+    switchTab("blacklist")
+    task.delay(.1, openBlModal)
 end)
 
 local addPopup = F(sg, UDim2.fromOffset(270, 40), UDim2.new(.5, -135, .5, -20), C.CARD, 8, 70)
@@ -1384,25 +1711,37 @@ addPopup.Visible = false
 Instance.new("UIStroke", addPopup).Color = C.WN; addPopup.UIStroke.Thickness = 1.5
 L(addPopup, "Tap player ที่ต้องการ blacklist", UDim2.new(1, -12, 1, 0), UDim2.fromOffset(6, 0), 10, BF, C.T1, Enum.TextXAlignment.Center, 71)
 
-local addModeActive = false; local addModeConn = nil
+local addModeActive = false
+local addModeConn = nil
+
 local function exitAddMode()
     addModeActive = false
     if addModeConn then addModeConn:Disconnect(); addModeConn = nil end
     showBlDimmer(false)
-    Tw(addPopup, .22, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+    pcall(function()
+        Tw(addPopup, .22, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+    end)
     task.delay(.24, function()
-        addPopup.Visible = false; addPopup.BackgroundTransparency = 0
+        addPopup.Visible = false
+        addPopup.BackgroundTransparency = 0
     end)
 end
+
 blAddBtn.MouseButton1Click:Connect(function()
     closeBlModal()
     task.delay(.18, function()
-        showBlDimmer(true); addPopup.BackgroundTransparency = 0
-        addPopup.Visible = true; addPopup.Size = UDim2.fromOffset(250, 34)
-        Tw(addPopup, .15, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(270, 40)})
+        showBlDimmer(true)
+        addPopup.BackgroundTransparency = 0
+        addPopup.Visible = true
+        addPopup.Size = UDim2.fromOffset(250, 34)
+        pcall(function()
+            Tw(addPopup, .15, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(270, 40)})
+        end)
         task.delay(2.5, function()
             if addModeActive then
-                Tw(addPopup, .35, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+                pcall(function()
+                    Tw(addPopup, .35, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
+                end)
                 task.delay(.4, function()
                     if addModeActive then addPopup.Visible = false end
                 end)
@@ -1428,11 +1767,15 @@ blAddBtn.MouseButton1Click:Connect(function()
                 if found then
                     S.blacklist[tostring(found.UserId)] = found.DisplayName
                     saveSettings(); exitAddMode()
-                    game:GetService("StarterGui"):SetCore("SendNotification", {
-                        Title = "⛔ Blacklisted",
-                        Text = found.DisplayName .. " will be ignored.",
-                        Duration = 3
-                    })
+                    pcall(function()
+                        if StarterGui then
+                            StarterGui:SetCore("SendNotification", {
+                                Title = "⛔ Blacklisted",
+                                Text = found.DisplayName .. " will be ignored.",
+                                Duration = 3
+                            })
+                        end
+                    end)
                 end
             end
         end)
@@ -1484,26 +1827,39 @@ local function refreshManage()
         e.TextXAlignment = Enum.TextXAlignment.Center
     end
 end
+
 local function openManageModal()
-    refreshManage(); mngModal.Visible = true
-    mngModal.BackgroundTransparency = 1; mngModal.Size = UDim2.fromOffset(240, 275)
-    Tw(mngModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(260, 290), BackgroundTransparency = 0})
+    refreshManage()
+    mngModal.Visible = true
+    mngModal.BackgroundTransparency = 1
+    mngModal.Size = UDim2.fromOffset(240, 275)
+    pcall(function()
+        Tw(mngModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(260, 290), BackgroundTransparency = 0})
+    end)
 end
+
 local function closeManageModal()
-    Tw(mngModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
-        {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 275)})
+    pcall(function()
+        Tw(mngModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
+            {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 275)})
+    end)
     task.delay(.13, function() mngModal.Visible = false end)
 end
+
 mngCloseBtn.MouseButton1Click:Connect(closeManageModal)
 blManageBtn.MouseButton1Click:Connect(function()
-    closeBlModal(); task.delay(.18, openManageModal)
+    closeBlModal()
+    task.delay(.18, openManageModal)
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- CONNECT LOGIC
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local function doConnect(key)
+    if type(key) ~= "string" then
+        statusLbl.Text = "● Invalid Key"; statusLbl.TextColor3 = C.NO; return
+    end
     key = key:gsub("%s+", "")
     if #key < 10 then
         statusLbl.Text = "● Invalid Key"; statusLbl.TextColor3 = C.NO; return
@@ -1515,7 +1871,9 @@ local function doConnect(key)
             S.connected = true
             statusLbl.Text = "● Connected ✓"; statusLbl.TextColor3 = C.OK
             pillDot.BackgroundColor3 = C.OK
-            if writefile then pcall(function() writefile(KEY_FILE, key) end) end
+            if writefile then
+                pcall(function() writefile(KEY_FILE, key) end)
+            end
             makeRing()
         else
             S.connected = false; S.key = ""
@@ -1524,14 +1882,15 @@ local function doConnect(key)
         end
     end)
 end
+
 connBtn.MouseButton1Click:Connect(function() doConnect(keyBox.Text) end)
 keyBox.FocusLost:Connect(function()
     if #keyBox.Text > 10 then doConnect(keyBox.Text) end
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- SEARCH
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 local SEARCH_KEYWORDS = {
     api = {"api", "key", "model", "connect", "groq", "gsk"},
     controls = {"chat", "observe", "prefix", "timing", "delay", "toggle"},
@@ -1541,6 +1900,7 @@ local SEARCH_KEYWORDS = {
     memory = {"memory", "clear", "player", "history", "greeting", "topic"},
     blacklist = {"blacklist", "block", "ban", "ignore"},
 }
+
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
     local q = searchBox.Text:lower():gsub("%s+", "")
     if q == "" then return end
@@ -1559,25 +1919,35 @@ sClear.MouseButton1Click:Connect(function() searchBox.Text = "" end)
 -- ═══════════════════════════════════════════════════════════════
 local function Minimize()
     savedMainPos = Main.Position; savedMainSize = Main.Size
-    Tw(Main, .18, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    pcall(function()
+        Tw(Main, .18, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    end)
     task.delay(.19, function()
         Main.Visible = false; miniPill.Visible = true
         miniPill.Position = savedPillPos; miniPill.Size = UDim2.fromOffset(0, 0)
-        Tw(miniPill, .24, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(48, 48)})
+        pcall(function()
+            Tw(miniPill, .24, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(48, 48)})
+        end)
     end)
 end
+
 MaximizeGUI = function()
     savedPillPos = miniPill.Position
-    Tw(miniPill, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    pcall(function()
+        Tw(miniPill, .14, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {Size = UDim2.fromOffset(0, 0)})
+    end)
     task.delay(.15, function()
         miniPill.Visible = false; Main.Visible = true
         Main.Size = UDim2.fromOffset(0, 0)
         local restorePos = savedMainPos or UDim2.new(.5, -gW / 2, .5, -gH / 2)
         local restoreSize = savedMainSize or UDim2.fromOffset(gW, gH)
         Main.Position = restorePos
-        Tw(Main, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = restoreSize})
+        pcall(function()
+            Tw(Main, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = restoreSize})
+        end)
     end)
 end
+
 minBtn.MouseButton1Click:Connect(Minimize)
 
 local mD = { on = false }
@@ -1693,11 +2063,12 @@ end
 
 UIS.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
-    if holdActive or iPopupVisible then return end
+    if holdActive then return end
     if addModeActive then return end
     if inp.UserInputType ~= Enum.UserInputType.MouseButton1
         and inp.UserInputType ~= Enum.UserInputType.Touch then return end
     local ok, guisAtPos = pcall(function()
+        if not GuiService then return nil end
         return GuiService:GetGuiObjectsAtPosition(inp.Position.X, inp.Position.Y)
     end)
     if ok and guisAtPos and #guisAtPos > 0 then return end
@@ -1841,10 +2212,10 @@ local function makeSmallBtn(text, bgColor, txtColor, stkColor, cx, cy)
     local stk = Instance.new("UIStroke", btn)
     stk.Color = stkColor; stk.Thickness = 1.5
     btn.MouseEnter:Connect(function()
-        Tw(btn, .12, nil, nil, {BackgroundTransparency = 0.2})
+        pcall(function() Tw(btn, .12, nil, nil, {BackgroundTransparency = 0.2}) end)
     end)
     btn.MouseLeave:Connect(function()
-        Tw(btn, .12, nil, nil, {BackgroundTransparency = 0})
+        pcall(function() Tw(btn, .12, nil, nil, {BackgroundTransparency = 0}) end)
     end)
     return btn
 end
@@ -1882,24 +2253,26 @@ function showRadialPopup(screenPos, targetPlayer)
     btnCancelToxic.Size = UDim2.fromOffset(0, 0)
     btnCancelToxic.Position = UDim2.fromOffset(CENTER - OFFSET, CENTER)
 
-    Tw(mainCircle, .22, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(MAIN_R * 2, MAIN_R * 2),
-         Position = UDim2.fromOffset(CENTER - MAIN_R, CENTER - MAIN_R)})
-    Tw(btnGreet, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
-         Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER - OFFSET - SMALL_R)})
-    Tw(btnBye, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
-         Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER + OFFSET - SMALL_R)})
-    Tw(btnToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
-         Position = UDim2.fromOffset(CENTER + OFFSET - SMALL_R, CENTER - SMALL_R)})
-    Tw(btnCancelToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-        {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
-         Position = UDim2.fromOffset(CENTER - OFFSET - SMALL_R, CENTER - SMALL_R)})
+    pcall(function()
+        Tw(mainCircle, .22, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(MAIN_R * 2, MAIN_R * 2),
+             Position = UDim2.fromOffset(CENTER - MAIN_R, CENTER - MAIN_R)})
+        Tw(btnGreet, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+             Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER - OFFSET - SMALL_R)})
+        Tw(btnBye, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+             Position = UDim2.fromOffset(CENTER - SMALL_R, CENTER + OFFSET - SMALL_R)})
+        Tw(btnToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+             Position = UDim2.fromOffset(CENTER + OFFSET - SMALL_R, CENTER - SMALL_R)})
+        Tw(btnCancelToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+            {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
+             Position = UDim2.fromOffset(CENTER - OFFSET - SMALL_R, CENTER - SMALL_R)})
+    end)
 end
 
--- ตัวช่วยหา player จาก popup
+-- Helper to find player from popup
 local function getPopupTarget()
     for _, p in ipairs(Players:GetPlayers()) do
         if p.DisplayName == targetNameLbl.Text then return p end
@@ -1952,10 +2325,14 @@ btnToxic.MouseButton1Click:Connect(function()
     local uid = tostring(target.UserId)
     local nm = S.playerNick[uid] or target.DisplayName
     S.toxicTargets[uid] = true
-    game:GetService("StarterGui"):SetCore("SendNotification", {
-        Title = "😈 Toxic Mode ON",
-        Text = "Now being toxic to: " .. nm, Duration = 3
-    })
+    pcall(function()
+        if StarterGui then
+            StarterGui:SetCore("SendNotification", {
+                Title = "😈 Toxic Mode ON",
+                Text = "Now being toxic to: " .. nm, Duration = 3
+            })
+        end
+    end)
     if S.connected then
         task.spawn(function()
             if S.responseDelay > 0 then task.wait(S.responseDelay) end
@@ -1967,7 +2344,7 @@ btnToxic.MouseButton1Click:Connect(function()
     end
 end)
 
--- ✅ Cancel Toxic — ล้าง history + ขออภัย + หยุดตัวใหญ่
+-- Cancel Toxic
 btnCancelToxic.MouseButton1Click:Connect(function()
     local target = getPopupTarget()
     closeRadialPopup()
@@ -1976,18 +2353,22 @@ btnCancelToxic.MouseButton1Click:Connect(function()
     local nm = S.playerNick[uid] or target.DisplayName
 
     if S.toxicTargets[uid] then
-        -- 1. ปิด toxic ทันที
+        -- 1. Turn off toxic immediately
         S.toxicTargets[uid] = nil
 
-        -- 2. ล้าง history ของคนนี้ทั้งหมด — ทำให้ AI ลืม pattern ตัวใหญ่
+        -- 2. Clear history
         clearPlayerHistory(uid)
 
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "✅ Toxic Mode OFF",
-            Text = "No longer toxic to: " .. nm, Duration = 3
-        })
+        pcall(function()
+            if StarterGui then
+                StarterGui:SetCore("SendNotification", {
+                    Title = "✅ Toxic Mode OFF",
+                    Text = "No longer toxic to: " .. nm, Duration = 3
+                })
+            end
+        end)
 
-        -- 3. ส่งข้อความขออภัย — ใช้ normal persona, พูดชื่อ, ห้ามตัวใหญ่
+        -- 3. Send apology
         if S.connected then
             task.spawn(function()
                 if S.responseDelay > 0 then task.wait(S.responseDelay) end
@@ -1995,7 +2376,6 @@ btnCancelToxic.MouseButton1Click:Connect(function()
                 local prompt = "[You were just being toxic to " .. nm .. " but now you've calmed down and feel genuinely sorry. Apologize sincerely to them. You MUST say their name '" .. nm .. "' first. Be genuinely remorseful and friendly. 1-2 short sentences. Do NOT use ALL CAPS. Use normal sentence case only.]"
                 local reply = callGroq(prompt, uid, nm, false, true, false)
                 if reply then
-                    -- บันทึกแค่ข้อความขออภัยเป็น history ใหม่ (ไม่ใช่ toxic)
                     addPlayerMem(uid, "assistant", reply)
                     saveMemory()
                     perform(reply, nm, uid, true)
@@ -2003,30 +2383,39 @@ btnCancelToxic.MouseButton1Click:Connect(function()
             end)
         end
     else
-        game:GetService("StarterGui"):SetCore("SendNotification", {
-            Title = "ℹ️ Info",
-            Text = nm .. " is not in toxic mode", Duration = 2
-        })
+        pcall(function()
+            if StarterGui then
+                StarterGui:SetCore("SendNotification", {
+                    Title = "ℹ️ Info",
+                    Text = nm .. " is not in toxic mode", Duration = 2
+                })
+            end
+        end)
     end
 end)
 
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 -- INIT
--- ══════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 switchTab("api")
 Main.Size = UDim2.fromOffset(0, 0)
 Main.BackgroundTransparency = 1
-Tw(Main, .32, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-    {Size = UDim2.fromOffset(gW, gH), BackgroundTransparency = 0})
+pcall(function()
+    Tw(Main, .32, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
+        {Size = UDim2.fromOffset(gW, gH), BackgroundTransparency = 0})
+end)
 
 if isfile and isfile(KEY_FILE) then
-    local saved = readfile(KEY_FILE):gsub("%s+", "")
-    if #saved > 10 then
-        keyBox.Text = saved
-        task.delay(.5, function() doConnect(saved) end)
-    end
+    pcall(function()
+        local saved = readfile(KEY_FILE):gsub("%s+", "")
+        if #saved > 10 then
+            keyBox.Text = saved
+            task.delay(.5, function() doConnect(saved) end)
+        end
+    end)
 end
+
 if HRP then makeRing() end
 currentModelLbl.Text = "Current: " .. S.currentModel
 
-print("[Groq AI v4.9.4] ✅ Loaded")
+print("[Groq AI v4.9.4] ✅ Loaded Successfully")
