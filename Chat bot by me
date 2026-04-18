@@ -1029,7 +1029,7 @@ local HDR_H = 30
 local BODY_OFFSET = TOP_H + TAB_H
 
 local TAB_WIN_H = {
-    api = 420, controls = 326, settings = 298, mood = 288,
+    api = 500, controls = 326, settings = 298, mood = 288,
     persona = 230, memory = 238, blacklist = 252, theme = 200,
     whitelist = 280,
 }
@@ -1439,7 +1439,7 @@ Instance.new("UICorner", keyBox).CornerRadius = UDim.new(0, 6)
 local statusLbl = L(apiCard1, "● Disconnected", UDim2.new(1, -102, 0, 18), UDim2.fromOffset(6, 52), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
 local connBtn = B(apiCard1, "Connect", UDim2.fromOffset(88, 24), UDim2.new(1, -96, 0, 50), C.AC, C.WIN, 10, 16)
 addHover(connBtn, Color3.fromRGB(70, 145, 240))
-L(apiCard1, "GROQ AI v4.9.4 · by IKKYU", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 80), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+L(apiCard1, "GROQ AI v4.9.5 · by IKKYU", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 80), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
 
 local apiCard2 = mkCard(pgAPI, 76, 2)
 mkLabel(apiCard2, "AI MODEL", 4)
@@ -1850,7 +1850,7 @@ L(themeInfo, "Theme preference resets on each script run",  UDim2.new(1,-12,0,14
 -- ═══════════════════════════════════════════════════════════════
 -- PAGE: API KEY — HTTP DEBUG CARD
 -- ═══════════════════════════════════════════════════════════════
-local dbCard = mkCard(pgAPI, 88, 3)
+local dbCard = mkCard(pgAPI, 88, 4)
 mkLabel(dbCard, "HTTP DEBUG", 4)
 
 local dbStatusLbl = L(dbCard, "Press Test to check HTTP support", UDim2.new(1,-12,0,30), UDim2.fromOffset(6,20), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
