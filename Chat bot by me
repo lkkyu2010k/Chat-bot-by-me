@@ -1,12 +1,10 @@
 --[[
 ╔══════════════════════════════════════════════════════════════╗
-║                   GROQ AI CONTROLLER v4.9.5                 ║
+║                   GROQ AI CONTROLLER v4.9.4                 ║
 ║                         by IKKYU                            ║
-║  ✅ Hold on player → Radial Popup (+ Talk center button)   ║
+║  ✅ Hold on player → Radial Popup (no button, no blur)     ║
 ║  ✅ Hold duration configurable in Settings                  ║
 ║  ✅ Cancel Toxic: ล้าง history + ขออภัย + หยุดตัวใหญ่     ║
-║  ✅ Whitelist system (new tab)                              ║
-║  ✅ Live Groq rate-limit token tracker                      ║
 ╚══════════════════════════════════════════════════════════════╝
 ]]
 
@@ -116,7 +114,6 @@ local MODEL = DEFAULT_MODEL
 local KEY_FILE = "GroqAI_Key.txt"
 local SET_FILE = "GroqAI_Settings.json"
 local MEM_FILE = "GroqAI_Memory.json"
-local WLIST_FILE = "GroqAI_Whitelist.json" -- [NEW]
 local CHAT_LIMIT = 194
 
 local AVAILABLE_MODELS = {
@@ -178,10 +175,6 @@ local S = {
     blacklist = {}, currentModel = DEFAULT_MODEL,
     greetedPlayers = {}, toxicTargets = {},
     holdDuration = 1.0,
-    -- [NEW] Whitelist + rate limit state
-    whitelist = {},
-    whitelistOn = false,
-    rateLimit = { remainingTokens = nil, remainingRequests = nil, resetTokens = nil, resetRequests = nil, resetTokensEpoch = 0, resetRequestsEpoch = 0, lastUpdate = 0 },
 }
 
 -- ═══════════════════════════════════════════════════════════════
@@ -196,7 +189,6 @@ local function saveSettings()
             userPersona = S.userPersona, observeInterval = S.observeInterval,
             blacklist = S.blacklist, currentModel = S.currentModel,
             holdDuration = S.holdDuration,
-            whitelistOn = S.whitelistOn, -- [NEW]
         }))
     end)
 end
@@ -220,8 +212,6 @@ local function loadSettings()
                 S.blacklist = v
             elseif k == "currentModel" and type(v) == "string" then
                 S.currentModel = v; MODEL = v
-            elseif k == "whitelistOn" and type(v) == "boolean" then -- [NEW]
-                S.whitelistOn = v
             elseif S[k] ~= nil then
                 S[k] = v
             end
@@ -255,30 +245,6 @@ local function loadMemory()
     end)
 end
 loadMemory()
-
--- [NEW] Whitelist save/load
-local function saveWhitelist()
-    if not writefile or not HttpService then return end
-    pcall(function()
-        writefile(WLIST_FILE, HttpService:JSONEncode({
-            whitelist = S.whitelist,
-        }))
-    end)
-end
-
-local function loadWhitelist()
-    if not isfile or not readfile or not HttpService then return end
-    if not isfile(WLIST_FILE) then return end
-    pcall(function()
-        local content = readfile(WLIST_FILE)
-        if not content or content == "" then return end
-        local d = HttpService:JSONDecode(content)
-        if type(d) == "table" and type(d.whitelist) == "table" then
-            S.whitelist = d.whitelist
-        end
-    end)
-end
-loadWhitelist()
 
 -- ═══════════════════════════════════════════════════════════════
 -- MEMORY FUNCTIONS
@@ -325,21 +291,6 @@ local function unstick()
     if S.thinking and (tick() - S.thinkStart) > 10 then
         S.thinking = false
     end
-end
-
--- [NEW] Parse Groq reset time strings like "7.66s" or "2m59.56s"
-local function parseGroqReset(str)
-    if not str or type(str) ~= "string" then return nil end
-    local total = 0
-    local mins = str:match("(%d+)m")
-    local secs = str:match("(%d+%.?%d*)s")
-    if mins then total = total + tonumber(mins) * 60 end
-    if secs then total = total + tonumber(secs) end
-    if total == 0 then
-        local n = tonumber(str)
-        if n then total = n end
-    end
-    return total
 end
 
 -- ═══════════════════════════════════════════════════════════════
@@ -477,14 +428,14 @@ local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
             msgs[#msgs+1] = { role = "system", content = TOXIC_PERSONA }
         else
             msgs[#msgs+1] = { role = "system", content = buildPersona() }
-            if uidK then
-                local cx = getCrossMemoryContext(userMsg, uidK)
-                if cx then msgs[#msgs+1] = { role = "system", content = cx } end
-            end
-            if uidK and S.playerHistory[uidK] then
-                for _, h in ipairs(S.playerHistory[uidK]) do
-                    msgs[#msgs+1] = h
-                end
+        end
+        if uidK then
+            local cx = getCrossMemoryContext(userMsg, uidK)
+            if cx then msgs[#msgs+1] = { role = "system", content = cx } end
+        end
+        if uidK and S.playerHistory[uidK] then
+            for _, h in ipairs(S.playerHistory[uidK]) do
+                msgs[#msgs+1] = h
             end
         end
     end
@@ -515,26 +466,6 @@ local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
     S.nextReq = tick() + math.max(S.cooldown or 1, 1)
     if res.StatusCode == 401 then return nil, "KEY" end
     if res.StatusCode ~= 200 then return nil, "ERR" .. tostring(res.StatusCode) end
-    
-    -- [NEW] Parse Groq rate-limit headers from every successful response
-    if res.Headers then
-        local h = res.Headers
-        local remTok = h["x-ratelimit-remaining-tokens"] or h["X-Ratelimit-Remaining-Tokens"]
-        local remReq = h["x-ratelimit-remaining-requests"] or h["X-Ratelimit-Remaining-Requests"]
-        local resTok = h["x-ratelimit-reset-tokens"] or h["X-Ratelimit-Reset-Tokens"]
-        local resReq = h["x-ratelimit-reset-requests"] or h["X-Ratelimit-Reset-Requests"]
-        if remTok then
-            S.rateLimit.remainingTokens = tonumber(remTok)
-            S.rateLimit.resetTokens = resTok
-            S.rateLimit.resetTokensEpoch = tick() + (parseGroqReset(resTok) or 0)
-        end
-        if remReq then
-            S.rateLimit.remainingRequests = tonumber(remReq)
-            S.rateLimit.resetRequests = resReq
-            S.rateLimit.resetRequestsEpoch = tick() + (parseGroqReset(resReq) or 0)
-        end
-        S.rateLimit.lastUpdate = tick()
-    end
     
     local data
     local decodeOk = pcall(function()
@@ -588,8 +519,6 @@ local function handleChat(plr, msg)
     
     local uid = tostring(plr.UserId)
     if S.blacklist[uid] then return end
-    -- [NEW] Whitelist check
-    if S.whitelistOn and not S.whitelist[uid] then return end
     
     if S.range > 0 then
         if not HRP or not HRP.Parent then return end
@@ -719,8 +648,6 @@ local function doObserve()
             local nm = S.playerNick[uid] or d.plr.DisplayName
             S.playerNames[uid] = d.plr.DisplayName
             if S.blacklist[uid] then continue end
-            -- [NEW] Whitelist filter
-            if S.whitelistOn and not S.whitelist[uid] then continue end
             local hasHistory = S.playerHistory[uid] and #S.playerHistory[uid] > 0
             if not hasHistory and not S.greetedPlayers[uid] then
                 greetTarget = { uid = uid, name = nm }
@@ -734,8 +661,10 @@ local function doObserve()
                 local w = math.min(S.responseDelay, 1.5)
                 if w > 0 then task.wait(w) end
                 if not S.talkOn or not S.chatOn or not S.connected then return end
-                -- [CHANGED] Standardized greet prompt to match popup Greet button
-                local greetPrompt = "[Greet " .. greetTarget.name .. " by saying their name '" .. greetTarget.name .. "' first naturally in the sentence, then add a casual friendly line. 1-2 short sentences only.]"
+                local greetPrompt = "[A player named " .. greetTarget.name
+                    .. " just walked near you. You MUST start your response by saying their name '"
+                    .. greetTarget.name .. "' first, then greet them casually like an old friend. "
+                    .. "1-2 short sentences only. This is the only time you should say their name.]"
                 local reply = callGroq(greetPrompt, greetTarget.uid, greetTarget.name, false, true, false)
                 if reply then
                     addPlayerMem(greetTarget.uid, "assistant", reply)
@@ -752,8 +681,6 @@ local function doObserve()
     for _, d in ipairs(nearby) do
         local uid = tostring(d.plr.UserId)
         if S.blacklist[uid] then continue end
-        -- [NEW] Whitelist filter
-        if S.whitelistOn and not S.whitelist[uid] then continue end
         local nm = S.playerNick[uid] or d.plr.DisplayName
         local prev = S.lastActions[d.plr.Name]
         if not prev or prev ~= d.act then changed = true end
@@ -771,8 +698,6 @@ local function doObserve()
     for _, d in ipairs(nearby) do
         local uid = tostring(d.plr.UserId)
         if S.blacklist[uid] then continue end
-        -- [NEW] Whitelist filter
-        if S.whitelistOn and not S.whitelist[uid] then continue end
         local hist = S.playerHistory[uid]
         if hist and #hist > bestCount then
             bestCount = #hist
@@ -1071,8 +996,8 @@ local HDR_H = 30
 local BODY_OFFSET = TOP_H + TAB_H
 
 local TAB_WIN_H = {
-    api = 460, controls = 326, settings = 298, mood = 288,
-    persona = 230, memory = 238, blacklist = 252, whitelist = 252, theme = 200, -- [CHANGED] api height +40, added whitelist
+    api = 420, controls = 326, settings = 298, mood = 288,
+    persona = 230, memory = 238, blacklist = 252, theme = 200,
 }
 
 local function calcWidth()
@@ -1259,7 +1184,7 @@ local activeTab = nil
 local TAB_NAMES = {
     api = "API Key", controls = "Controls", settings = "Settings",
     mood = "Mood", persona = "Persona", memory = "Memory", blacklist = "Blacklist",
-    whitelist = "Whitelist", theme = "Theme", -- [CHANGED] added whitelist
+    theme = "Theme",
 }
 
 local function makePage(name)
@@ -1373,8 +1298,7 @@ makeTab("🎭", "Mood", "mood", 4)
 makeTab("✏️", "Persona", "persona", 5)
 makeTab("💾", "Memory", "memory", 6)
 makeTab("⛔", "Blacklist", "blacklist", 7)
-makeTab("✅", "Whitelist", "whitelist", 8) -- [NEW]
-makeTab("🎨", "Theme", "theme", 9)
+makeTab("🎨", "Theme", "theme", 8)
 
 -- ═══════════════════════════════════════════════════════════════
 -- CARD & ROW HELPERS
@@ -1480,7 +1404,7 @@ Instance.new("UICorner", keyBox).CornerRadius = UDim.new(0, 6)
 local statusLbl = L(apiCard1, "● Disconnected", UDim2.new(1, -102, 0, 18), UDim2.fromOffset(6, 52), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
 local connBtn = B(apiCard1, "Connect", UDim2.fromOffset(88, 24), UDim2.new(1, -96, 0, 50), C.AC, C.WIN, 10, 16)
 addHover(connBtn, Color3.fromRGB(70, 145, 240))
-L(apiCard1, "GROQ AI v4.9.5 · by IKKYU", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 80), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
+L(apiCard1, "GROQ AI v4.9.4 · by IKKYU", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 80), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
 
 local apiCard2 = mkCard(pgAPI, 76, 2)
 mkLabel(apiCard2, "AI MODEL", 4)
@@ -1488,50 +1412,6 @@ local currentModelLbl = L(apiCard2, "Current: " .. S.currentModel, UDim2.new(1, 
 currentModelLbl.TextTruncate = Enum.TextTruncate.AtEnd
 local modelBtn = B(apiCard2, "🤖  Select Model", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 38), C.CD, C.T1, 10, 16)
 addHover(modelBtn, Color3.fromRGB(225, 227, 242))
-
--- [NEW] Rate limit / token status card
-local apiCard3 = mkCard(pgAPI, 96, 3)
-mkLabel(apiCard3, "RATE LIMITS (Live)", 4)
-local tokStatusLbl = L(apiCard3, "Tokens: -- | Requests: --", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
-local tokResetLbl = L(apiCard3, "Waiting for API response...", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 36), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
-local tokRefreshBtn = B(apiCard3, "🔄 Refresh", UDim2.fromOffset(84, 22), UDim2.new(1, -94, 0, 52), C.CD, C.T1, 9, 16)
-addHover(tokRefreshBtn, Color3.fromRGB(225, 227, 242))
-
-local function updateRateLimitUI() -- [NEW]
-    local rl = S.rateLimit
-    local tStr = rl.remainingTokens and tostring(rl.remainingTokens) or "--"
-    local rStr = rl.remainingRequests and tostring(rl.remainingRequests) or "--"
-    tokStatusLbl.Text = "Tokens: " .. tStr .. " | Requests: " .. rStr
-
-    local now = tick()
-    local parts = {}
-    if rl.resetTokensEpoch and rl.resetTokensEpoch > now then
-        parts[#parts+1] = "Tok reset " .. math.ceil(rl.resetTokensEpoch - now) .. "s"
-    end
-    if rl.resetRequestsEpoch and rl.resetRequestsEpoch > now then
-        parts[#parts+1] = "Req reset " .. math.ceil(rl.resetRequestsEpoch - now) .. "s"
-    end
-    tokResetLbl.Text = #parts > 0 and table.concat(parts, " | ") or "Limits refreshed"
-
-    if rl.remainingTokens and rl.remainingTokens < 500 then
-        tokStatusLbl.TextColor3 = C.NO
-    elseif rl.remainingTokens and rl.remainingTokens < 1500 then
-        tokStatusLbl.TextColor3 = C.WN
-    else
-        tokStatusLbl.TextColor3 = C.T1
-    end
-end
-
-tokRefreshBtn.MouseButton1Click:Connect(function()
-    pcall(updateRateLimitUI)
-end)
-
-task.spawn(function() -- [NEW] Live countdown loop
-    while sg and sg.Parent do
-        task.wait(1)
-        pcall(updateRateLimitUI)
-    end
-end)
 
 -- ═══════════════════════════════════════════════════════════════
 -- PAGE: CONTROLS
@@ -1672,7 +1552,7 @@ L(themeInfo, "Theme preference resets on each script run",  UDim2.new(1,-12,0,14
 -- ═══════════════════════════════════════════════════════════════
 -- PAGE: API KEY — HTTP DEBUG CARD
 -- ═══════════════════════════════════════════════════════════════
-local dbCard = mkCard(pgAPI, 88, 4) -- [CHANGED] order 4 (was 3)
+local dbCard = mkCard(pgAPI, 88, 3)
 mkLabel(dbCard, "HTTP DEBUG", 4)
 
 local dbStatusLbl = L(dbCard, "Press Test to check HTTP support", UDim2.new(1,-12,0,30), UDim2.fromOffset(6,20), 9, RF, C.T2, Enum.TextXAlignment.Left, 15)
@@ -1974,220 +1854,6 @@ blManageBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ═══════════════════════════════════════════════════════════════
--- [NEW] WHITELIST GUI SYSTEM
--- ═══════════════════════════════════════════════════════════════
-local pgWL = makePage("whitelist")
-
-local wlInfoCard = mkCard(pgWL, 54, 1)
-mkLabel(wlInfoCard, "WHITELIST", 4)
-L(wlInfoCard, "Allow mode — AI จะตอบเฉพาะคนที่อยู่ใน whitelist", UDim2.new(1, -12, 0, 14), UDim2.fromOffset(6, 20), 9, RF, C.T1, Enum.TextXAlignment.Left, 15)
-L(wlInfoCard, "Hold on player ในเกมเพื่อเพิ่ม whitelist", UDim2.new(1, -12, 0, 12), UDim2.fromOffset(6, 34), 8, RF, C.T2, Enum.TextXAlignment.Left, 15)
-
-local wlActCard = mkCard(pgWL, 108, 2)
--- Toggle row
-local wlToggleRow = Instance.new("Frame", wlActCard)
-wlToggleRow.Size = UDim2.new(1, -12, 0, 28); wlToggleRow.Position = UDim2.fromOffset(6, 5)
-wlToggleRow.BackgroundTransparency = 1; wlToggleRow.ZIndex = 15
-L(wlToggleRow, "✅  Whitelist Active", UDim2.new(1, -54, 1, 0), nil, 10, RF, C.T1, Enum.TextXAlignment.Left, 15)
-local wlToggleBtn = B(wlToggleRow, S.whitelistOn and "ON" or "OFF", UDim2.fromOffset(48, 22), UDim2.new(1, -48, .5, -11),
-    S.whitelistOn and C.OK or C.CD, S.whitelistOn and C.WIN or C.T2, 9, 16)
-addHover(wlToggleBtn)
-wlToggleBtn.MouseButton1Click:Connect(function()
-    S.whitelistOn = not S.whitelistOn
-    wlToggleBtn.Text = S.whitelistOn and "ON" or "OFF"
-    wlToggleBtn.BackgroundColor3 = S.whitelistOn and C.OK or C.CD
-    wlToggleBtn.TextColor3 = S.whitelistOn and C.WIN or C.T2
-    saveSettings()
-end)
-
-local wlOpenBtn = B(wlActCard, "✅  Open Whitelist Menu", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 37), C.AC, C.WIN, 10, 16)
-local wlManage2 = B(wlActCard, "📋  Manage Whitelist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 69), C.CD, C.T1, 10, 16)
-addHover(wlOpenBtn, Color3.fromRGB(70, 145, 240))
-addHover(wlManage2, Color3.fromRGB(225, 227, 242))
-
-local wlModal = F(sg, UDim2.fromOffset(260, 152), UDim2.new(.5, -130, .5, -76), C.CARD, 12, 60)
-wlModal.Visible = false; wlModal.ClipsDescendants = true
-Instance.new("UIStroke", wlModal).Color = C.AC; wlModal.UIStroke.Thickness = 1.5
-L(wlModal, "✅  WHITELIST", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 4), 11, BF, C.AC, Enum.TextXAlignment.Center, 61)
-local wlBackBtn = B(wlModal, "◀  Back", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 34), C.CD, C.T1, 10, 61)
-local wlAddBtn = B(wlModal, "➕  Add to Whitelist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 64), C.AC, C.WIN, 10, 61)
-local wlManageBtn = B(wlModal, "📋  Manage Whitelist", UDim2.new(1, -12, 0, 26), UDim2.fromOffset(6, 94), C.WN, C.WIN, 10, 61)
-addHover(wlBackBtn, Color3.fromRGB(225, 227, 242))
-addHover(wlAddBtn, Color3.fromRGB(70, 145, 240))
-addHover(wlManageBtn, Color3.fromRGB(190, 140, 20))
-
-local function openWlModal()
-    wlModal.Visible = true; wlModal.BackgroundTransparency = 1
-    wlModal.Size = UDim2.fromOffset(240, 140)
-    pcall(function()
-        Tw(wlModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-            {Size = UDim2.fromOffset(260, 152), BackgroundTransparency = 0})
-    end)
-end
-
-local function closeWlModal()
-    pcall(function()
-        Tw(wlModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
-            {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 140)})
-    end)
-    task.delay(.13, function() wlModal.Visible = false end)
-end
-
-wlBackBtn.MouseButton1Click:Connect(closeWlModal)
-wlOpenBtn.MouseButton1Click:Connect(openWlModal)
-wlManage2.MouseButton1Click:Connect(function()
-    switchTab("whitelist")
-    task.delay(.1, openWlModal)
-end)
-
-local wlAddPopup = F(sg, UDim2.fromOffset(270, 40), UDim2.new(.5, -135, .5, -20), C.CARD, 8, 70)
-wlAddPopup.Visible = false
-Instance.new("UIStroke", wlAddPopup).Color = C.AC; wlAddPopup.UIStroke.Thickness = 1.5
-L(wlAddPopup, "Tap player ที่ต้องการ whitelist", UDim2.new(1, -12, 1, 0), UDim2.fromOffset(6, 0), 10, BF, C.T1, Enum.TextXAlignment.Center, 71)
-
-local wlAddModeActive = false
-local wlAddModeConn = nil
-
-local function exitWlAddMode()
-    wlAddModeActive = false
-    if wlAddModeConn then wlAddModeConn:Disconnect(); wlAddModeConn = nil end
-    showBlDimmer(false)
-    pcall(function()
-        Tw(wlAddPopup, .22, Enum.EasingStyle.Quart, Enum.EasingDirection.In, {BackgroundTransparency = 1})
-    end)
-    task.delay(.24, function()
-        wlAddPopup.Visible = false
-        wlAddPopup.BackgroundTransparency = 0
-    end)
-end
-
-wlAddBtn.MouseButton1Click:Connect(function()
-    closeWlModal()
-    task.delay(.18, function()
-        showBlDimmer(true)
-        wlAddPopup.BackgroundTransparency = 0
-        wlAddPopup.Visible = true
-        wlAddPopup.Size = UDim2.fromOffset(250, 34)
-        pcall(function()
-            Tw(wlAddPopup, .15, Enum.EasingStyle.Back, Enum.EasingDirection.Out, {Size = UDim2.fromOffset(270, 40)})
-        end)
-        task.delay(2.5, function()
-            if wlAddModeActive then
-                pcall(function()
-                    Tw(wlAddPopup, .35, Enum.EasingStyle.Quad, Enum.EasingDirection.In, {BackgroundTransparency = 1})
-                end)
-                task.delay(.4, function()
-                    if wlAddModeActive then wlAddPopup.Visible = false end
-                end)
-            end
-        end)
-        wlAddModeActive = true
-        wlAddModeConn = UIS.InputBegan:Connect(function(inp, gpe)
-            if gpe or not wlAddModeActive then return end
-            if inp.UserInputType ~= Enum.UserInputType.MouseButton1
-                and inp.UserInputType ~= Enum.UserInputType.Touch then return end
-            local ray = Camera:ScreenPointToRay(inp.Position.X, inp.Position.Y)
-            local rp = RaycastParams.new()
-            rp.FilterType = Enum.RaycastFilterType.Exclude
-            rp.FilterDescendantsInstances = LP.Character and {LP.Character} or {}
-            local result = workspace:Raycast(ray.Origin, ray.Direction * 600, rp)
-            if result and result.Instance then
-                local found = nil
-                for _, p in ipairs(Players:GetPlayers()) do
-                    if p ~= LP and p.Character and result.Instance:IsDescendantOf(p.Character) then
-                        found = p; break
-                    end
-                end
-                if found then
-                    S.whitelist[tostring(found.UserId)] = found.DisplayName
-                    saveWhitelist(); exitWlAddMode()
-                    pcall(function()
-                        if StarterGui then
-                            StarterGui:SetCore("SendNotification", {
-                                Title = "✅ Whitelisted",
-                                Text = found.DisplayName .. " is now allowed.",
-                                Duration = 3
-                            })
-                        end
-                    end)
-                end
-            end
-        end)
-    end)
-end)
-
-local wlMngModal = F(sg, UDim2.fromOffset(260, 290), UDim2.new(.5, -130, .5, -145), C.CARD, 10, 65)
-wlMngModal.Visible = false; wlMngModal.ClipsDescendants = true
-Instance.new("UIStroke", wlMngModal).Color = C.BD
-local wlMngHdr = F(wlMngModal, UDim2.new(1, 0, 0, 32), UDim2.new(), C.AREA, 8, 66)
-local wlMngHdrP = Instance.new("Frame", wlMngHdr)
-wlMngHdrP.Size = UDim2.new(1, 0, 0, 14); wlMngHdrP.Position = UDim2.new(0, 0, 1, -14)
-wlMngHdrP.BackgroundColor3 = C.AREA; wlMngHdrP.BorderSizePixel = 0; wlMngHdrP.ZIndex = 66
-L(wlMngHdr, "📋  MANAGE WHITELIST", UDim2.new(1, -36, 1, 0), UDim2.fromOffset(6, 0), 10, BF, C.T1, Enum.TextXAlignment.Left, 67)
-local wlMngCloseBtn = B(wlMngHdr, "✕", UDim2.fromOffset(20, 20), UDim2.new(1, -24, .5, -10), C.NO, C.WIN, 12, 67)
-addHover(wlMngCloseBtn, Color3.fromRGB(230, 55, 55))
-local wlMngScroll = Instance.new("ScrollingFrame", wlMngModal)
-wlMngScroll.Size = UDim2.new(1, -8, 1, -38); wlMngScroll.Position = UDim2.fromOffset(4, 34)
-wlMngScroll.BackgroundTransparency = 1; wlMngScroll.ScrollBarThickness = 3
-wlMngScroll.ScrollBarImageColor3 = C.BD; wlMngScroll.ScrollBarImageTransparency = 0.3
-wlMngScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y; wlMngScroll.CanvasSize = UDim2.new()
-wlMngScroll.ZIndex = 66; wlMngScroll.ClipsDescendants = true
-local wlMngLL = Instance.new("UIListLayout", wlMngScroll); wlMngLL.Padding = UDim.new(0, 4)
-Instance.new("UIPadding", wlMngScroll).PaddingTop = UDim.new(0, 3)
-Instance.new("UIPadding", wlMngScroll).PaddingBottom = UDim.new(0, 3)
-
-local function refreshWlManage()
-    for _, ch in ipairs(wlMngScroll:GetChildren()) do
-        if ch:IsA("Frame") or ch:IsA("TextLabel") then ch:Destroy() end
-    end
-    local count = 0
-    for uid, dname in pairs(S.whitelist) do
-        count = count + 1
-        local row = F(wlMngScroll, UDim2.new(1, -4, 0, 34), nil, C.CD, 6, 67)
-        L(row, dname, UDim2.new(1, -66, 0, 18), UDim2.fromOffset(5, 3), 10, BF, C.T1, Enum.TextXAlignment.Left, 68)
-        L(row, "UID: " .. uid, UDim2.new(1, -66, 0, 12), UDim2.fromOffset(5, 20), 8, RF, C.T2, Enum.TextXAlignment.Left, 68)
-        local removeBtn = B(row, "Remove", UDim2.fromOffset(58, 22), UDim2.new(1, -62, .5, -11), C.NO, C.WIN, 9, 68)
-        addHover(removeBtn, Color3.fromRGB(230, 55, 55))
-        local cu = uid
-        removeBtn.MouseButton1Click:Connect(function()
-            S.whitelist[cu] = nil; saveWhitelist(); refreshWlManage()
-        end)
-    end
-    if count == 0 then
-        local e = Instance.new("TextLabel", wlMngScroll)
-        e.Size = UDim2.new(1, 0, 0, 40); e.BackgroundTransparency = 1
-        e.Text = "No players whitelisted."; e.TextColor3 = C.T2
-        e.Font = RF; e.TextSize = 9; e.ZIndex = 67
-        e.TextXAlignment = Enum.TextXAlignment.Center
-    end
-end
-
-local function openWlManageModal()
-    refreshWlManage()
-    wlMngModal.Visible = true
-    wlMngModal.BackgroundTransparency = 1
-    wlMngModal.Size = UDim2.fromOffset(240, 275)
-    pcall(function()
-        Tw(wlMngModal, .18, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-            {Size = UDim2.fromOffset(260, 290), BackgroundTransparency = 0})
-    end)
-end
-
-local function closeWlManageModal()
-    pcall(function()
-        Tw(wlMngModal, .12, Enum.EasingStyle.Quart, Enum.EasingDirection.In,
-            {BackgroundTransparency = 1, Size = UDim2.fromOffset(240, 275)})
-    end)
-    task.delay(.13, function() wlMngModal.Visible = false end)
-end
-
-wlMngCloseBtn.MouseButton1Click:Connect(closeWlManageModal)
-wlManageBtn.MouseButton1Click:Connect(function()
-    closeWlModal()
-    task.delay(.18, openWlManageModal)
-end)
-
--- ═══════════════════════════════════════════════════════════════
 -- CONNECT LOGIC
 -- ═══════════════════════════════════════════════════════════════
 local function doConnect(key)
@@ -2226,14 +1892,13 @@ end)
 -- SEARCH
 -- ═══════════════════════════════════════════════════════════════
 local SEARCH_KEYWORDS = {
-    api = {"api", "key", "model", "connect", "groq", "gsk", "token", "rate", "limit"},
+    api = {"api", "key", "model", "connect", "groq", "gsk"},
     controls = {"chat", "observe", "prefix", "timing", "delay", "toggle"},
     settings = {"range", "cooldown", "stud", "ring", "setting", "hold", "duration"},
     mood = {"mood", "friendly", "funny", "quiet", "smart", "aggro", "personality", "slider"},
     persona = {"persona", "custom", "identity"},
     memory = {"memory", "clear", "player", "history", "greeting", "topic"},
     blacklist = {"blacklist", "block", "ban", "ignore"},
-    whitelist = {"whitelist", "allow", "permit", "only"}, -- [NEW]
 }
 
 searchBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -2400,7 +2065,6 @@ UIS.InputBegan:Connect(function(inp, gpe)
     if gpe then return end
     if holdActive then return end
     if addModeActive then return end
-    if wlAddModeActive then return end -- [NEW] Also block during whitelist add
     if inp.UserInputType ~= Enum.UserInputType.MouseButton1
         and inp.UserInputType ~= Enum.UserInputType.Touch then return end
     local ok, guisAtPos = pcall(function()
@@ -2535,28 +2199,6 @@ targetNameLbl.ZIndex = IZ + 35
 targetNameLbl.TextTruncate = Enum.TextTruncate.AtEnd
 targetNameLbl.TextXAlignment = Enum.TextXAlignment.Center
 
--- [NEW] Center Talk button
-local btnTalk = Instance.new("TextButton", iPopup)
-btnTalk.Size = UDim2.fromOffset(0, 0)
-btnTalk.Position = UDim2.fromOffset(CENTER - 25, CENTER - 11)
-btnTalk.BackgroundColor3 = Color3.fromRGB(120, 88, 255)
-btnTalk.BorderSizePixel = 0
-btnTalk.Text = "Talk"
-btnTalk.TextColor3 = Color3.fromRGB(255, 255, 255)
-btnTalk.Font = Enum.Font.GothamBold
-btnTalk.TextSize = 9
-btnTalk.AutoButtonColor = false
-btnTalk.ZIndex = IZ + 40
-Instance.new("UICorner", btnTalk).CornerRadius = UDim.new(0, 6)
-local talkStk = Instance.new("UIStroke", btnTalk)
-talkStk.Color = Color3.fromRGB(100, 70, 220); talkStk.Thickness = 1.5
-btnTalk.MouseEnter:Connect(function()
-    pcall(function() Tw(btnTalk, .12, nil, nil, {BackgroundTransparency = 0.2}) end)
-end)
-btnTalk.MouseLeave:Connect(function()
-    pcall(function() Tw(btnTalk, .12, nil, nil, {BackgroundTransparency = 0}) end)
-end)
-
 local function makeSmallBtn(text, bgColor, txtColor, stkColor, cx, cy)
     local btn = Instance.new("TextButton", iPopup)
     btn.Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2)
@@ -2610,8 +2252,6 @@ function showRadialPopup(screenPos, targetPlayer)
     btnToxic.Position = UDim2.fromOffset(CENTER + OFFSET, CENTER)
     btnCancelToxic.Size = UDim2.fromOffset(0, 0)
     btnCancelToxic.Position = UDim2.fromOffset(CENTER - OFFSET, CENTER)
-    btnTalk.Size = UDim2.fromOffset(0, 0) -- [NEW]
-    btnTalk.Position = UDim2.fromOffset(CENTER, CENTER) -- [NEW]
 
     pcall(function()
         Tw(mainCircle, .22, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
@@ -2629,10 +2269,6 @@ function showRadialPopup(screenPos, targetPlayer)
         Tw(btnCancelToxic, .28, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
             {Size = UDim2.fromOffset(SMALL_R * 2, SMALL_R * 2),
              Position = UDim2.fromOffset(CENTER - OFFSET - SMALL_R, CENTER - SMALL_R)})
-        -- [NEW] Animate Talk button
-        Tw(btnTalk, .24, Enum.EasingStyle.Back, Enum.EasingDirection.Out,
-            {Size = UDim2.fromOffset(50, 24),
-             Position = UDim2.fromOffset(CENTER - 25, CENTER - 11)})
     end)
 end
 
@@ -2643,41 +2279,6 @@ local function getPopupTarget()
     end
     return nil
 end
-
--- [NEW] Talk button — continue current topic
-btnTalk.MouseButton1Click:Connect(function()
-    local target = getPopupTarget()
-    closeRadialPopup()
-    if not target or not S.connected then return end
-    local uid = tostring(target.UserId)
-    local nm = S.playerNick[uid] or target.DisplayName
-    local hist = S.playerHistory[uid]
-
-    local prompt
-    if hist and #hist > 0 then
-        local lines = {}
-        local si = math.max(1, #hist - 4)
-        for i = si, #hist do
-            lines[#lines+1] = (hist[i].role == "user" and nm or "You") .. ": " .. hist[i].content
-        end
-        prompt = "[Based on this recent conversation with " .. nm .. ":\n"
-            .. table.concat(lines, "\n")
-            .. "\n\nContinue talking naturally about the same topic. Keep it short and casual. Do NOT say their name.]"
-    else
-        prompt = "[Start a fun casual conversation with " .. nm .. ". Pick any interesting topic. 1-2 short sentences. Do NOT say their name.]"
-    end
-
-    task.spawn(function()
-        if S.responseDelay > 0 then task.wait(S.responseDelay) end
-        if not S.connected then return end
-        local reply = callGroq(prompt, uid, nm, false, true, false)
-        if reply then
-            addPlayerMem(uid, "assistant", reply)
-            saveMemory()
-            perform(reply, nm, uid, true)
-        end
-    end)
-end)
 
 -- Greet
 btnGreet.MouseButton1Click:Connect(function()
@@ -2817,4 +2418,4 @@ end
 if HRP then makeRing() end
 currentModelLbl.Text = "Current: " .. S.currentModel
 
-print("[Groq AI v4.9.5] ✅ Loaded Successfully")
+print("[Groq AI v4.9.4] ✅ Loaded Successfully")
