@@ -372,10 +372,8 @@ local function callGroq(userMsg, uid, name, isObs, skipSave, isToxic)
                 else
                         msgs[#msgs+1] = { role = "system", content = buildPersona() }
                 end
-                if uidK then
-                        local cx = getCrossMemoryContext(userMsg, uidK)
-                        if cx then msgs[#msgs+1] = { role = "system", content = cx } end
-                end
+                -- NOTE: Cross-memory context removed — each player's conversation
+                -- is now fully independent. No topic contamination between players.
                 if uidK and S.playerHistory[uidK] then
                         for _, h in ipairs(S.playerHistory[uidK]) do
                                 msgs[#msgs+1] = h
@@ -615,39 +613,63 @@ local function doObserve()
         local nearby = getNearby()
         if #nearby == 0 then return end
 
+        -- ═══════════════════════════════════════════════════════════
+        -- NEW LOGIC:
+        -- 1. If both chatOn + talkOn: Only continue existing conversations
+        --    per-player. NO greeting. Each player is independent.
+        -- 2. If talkOn only (no chatOn): Observe surroundings, react to
+        --    changes. Still no cross-player topic contamination.
+        -- 3. If no history with anyone → stay silent, don't speak.
+        -- ═══════════════════════════════════════════════════════════
+
         if S.chatOn then
-                local greetTarget = nil
+                -- Both modes ON: Find a nearby player we ALREADY have history with
+                -- and continue that specific conversation. No greeting, no cross-contamination.
+                local continueTarget = nil
                 for _, d in ipairs(nearby) do
                         local uid = tostring(d.plr.UserId)
-                        local nm = S.playerNick[uid] or d.plr.DisplayName
-                        S.playerNames[uid] = d.plr.DisplayName
                         if S.blacklist[uid] then continue end
                         if not isWhitelisted(d.plr) then continue end
-                        local hasHistory = S.playerHistory[uid] and #S.playerHistory[uid] > 0
-                        if not hasHistory and not S.greetedPlayers[uid] then
-                                greetTarget = { uid = uid, name = nm }
+                        local hist = S.playerHistory[uid]
+                        if hist and #hist > 0 then
+                                continueTarget = { uid = uid, plr = d.plr, dist = d.dist }
                                 break
                         end
                 end
-                if greetTarget then
-                        S.lastObserve = tick()
-                        S.greetedPlayers[greetTarget.uid] = true
-                        task.spawn(function()
-                                local w = math.min(S.responseDelay, 1.5)
-                                if w > 0 then task.wait(w) end
-                                if not S.talkOn or not S.chatOn or not S.connected then return end
-                                -- Same greet prompt as popup Greet button
-                                local reply = callGroq(makeGreetPrompt(greetTarget.name), greetTarget.uid, greetTarget.name, false, true, false)
-                                if reply then
-                                        addPlayerMem(greetTarget.uid, "assistant", reply)
-                                        saveMemory()
-                                        perform(reply, greetTarget.name, greetTarget.uid, true)
-                                end
-                        end)
+
+                if not continueTarget then
+                        -- No history with anyone nearby → stay silent, don't greet
                         return
                 end
+
+                S.lastObserve = tick()
+                local uid = continueTarget.uid
+                local nm = S.playerNick[uid] or continueTarget.plr.DisplayName
+                S.playerNames[uid] = continueTarget.plr.DisplayName
+
+                task.spawn(function()
+                        local w = math.min(S.responseDelay, 1.5)
+                        if w > 0 then task.wait(w) end
+                        if not S.talkOn or not S.chatOn or not S.connected then return end
+
+                        -- Continue THIS player's conversation only (no cross-memory)
+                        local prompt = "[Continue the conversation with " .. nm .. " naturally. "
+                                .. "Reference the last thing discussed and say something related. "
+                                .. "Do NOT change the subject. Do NOT bring up topics from other conversations. "
+                                .. "Keep it casual and short, like talking to a close friend. "
+                                .. "1 short sentence only. Do NOT say their name.]"
+                        local reply = callGroq(prompt, uid, nm, false, true, S.toxicTargets[uid] == true)
+                        if reply then
+                                addPlayerMem(uid, "assistant", reply)
+                                saveMemory()
+                                perform(reply, nm, uid, true)
+                        end
+                end)
+                return
         end
 
+        -- talkOn only (chatOn is OFF): Observe surroundings reactively
+        -- Still isolate per-player — no cross-contamination
         local changed = false
         local lines = {}
         for _, d in ipairs(nearby) do
@@ -664,44 +686,44 @@ local function doObserve()
         if not changed and math.random(100) > 25 then return end
         S.lastObserve = tick()
 
-        local memLines = {}
-        local bestUid, bestCount = nil, 0
+        -- Per-player continuation: find a nearby player with history
+        -- and continue only their conversation (no cross-contamination)
+        local contUid = nil
         for _, d in ipairs(nearby) do
                 local uid = tostring(d.plr.UserId)
                 if S.blacklist[uid] then continue end
                 local hist = S.playerHistory[uid]
-                if hist and #hist > bestCount then bestCount = #hist; bestUid = uid end
-        end
-        if bestUid and S.playerHistory[bestUid] then
-                local hist = S.playerHistory[bestUid]
-                local si = math.max(1, #hist - 5)
-                for i = si, #hist do
-                        local h = hist[i]
-                        local nm = (h.role == "user")
-                                and (S.playerNick[bestUid] or S.playerNames[bestUid] or "Player")
-                                or "You"
-                        memLines[#memLines+1] = nm .. ": " .. h.content
-                end
+                if hist and #hist > 0 then contUid = uid; break end
         end
 
         local prompt
-        if #memLines > 0 then
-                prompt = "[Here is a past conversation from your memory:\n"
+        if contUid and S.playerHistory[contUid] then
+                -- Continue this specific player's conversation only
+                local hist = S.playerHistory[contUid]
+                local nm = S.playerNick[contUid] or S.playerNames[contUid] or "Player"
+                local memLines = {}
+                local si = math.max(1, #hist - 4)
+                for i = si, #hist do
+                        local h = hist[i]
+                        local who = (h.role == "user") and nm or "You"
+                        memLines[#memLines+1] = who .. ": " .. h.content
+                end
+                prompt = "[Your past conversation with " .. nm .. ":\n"
                         .. table.concat(memLines, "\n")
-                        .. "\n\nBased on this past conversation, say something natural and casual that continues or references it. "
-                        .. "Do NOT say 'I think'. Do NOT make up new topics. Speak like continuing an old conversation with a friend. "
+                        .. "\n\nContinue this conversation naturally with " .. nm .. ". "
+                        .. "Do NOT bring up topics from other people's conversations. "
+                        .. "Do NOT change the subject. Speak like continuing with a friend. "
                         .. "1 short sentence only.]"
         else
-                local ctx = "Nearby:\n" .. table.concat(lines, "\n")
-                if changed then ctx = ctx .. "\n[Something changed, react naturally. 1 short sentence.]" end
-                prompt = ctx
+                -- No history with anyone nearby → stay silent
+                return
         end
 
         task.spawn(function()
                 local w = math.min(S.responseDelay, 1.5)
                 if w > 0 then task.wait(w) end
                 if not S.talkOn or not S.connected then return end
-                local reply = callGroq(prompt, nil, nil, #memLines == 0)
+                local reply = callGroq(prompt, nil, nil, false)
                 if reply then
                         local m = reply:gsub("^%s+", ""):gsub("%s+$", "")
                         if m:match("%S") then sendChat(m) end
